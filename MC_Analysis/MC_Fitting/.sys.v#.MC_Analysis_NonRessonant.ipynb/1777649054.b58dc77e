@@ -1,0 +1,429 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "c49c0359-d5df-4848-8117-fd1af404f37a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import uproot\n",
+    "import dask_awkward as dak\n",
+    "import awkward as ak\n",
+    "import zfit\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.gridspec as gridspec\n",
+    "import mplhep as hep\n",
+    "from dask.diagnostics import ProgressBar"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d9175717-bc4d-4a11-8fb3-bbbe59f6c692",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.style.use(hep.style.CMS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "6c8da088-96f9-4920-a734-f3eec4e90c66",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mc_files = {\"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_signal_2022.root\": \"Events\"}\n",
+    "df = uproot.dask(mc_files)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9ab8ac5f-b9ba-427b-b32a-0c6d6484c275",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_perfect_b0_matter_mask(df):\n",
+    "    # --- 1. Constantes PDG ---\n",
+    "    PDG_B0        = 511\n",
+    "    PDG_KSTAR     = 313\n",
+    "    PDG_KAON_plus = 321\n",
+    "    PDG_PION_neg  = -211\n",
+    "    PDG_MUON_plus = -13\n",
+    "    PDG_MUON_neg  = 13\n",
+    "    PDG_PHOTON    = 22\n",
+    "\n",
+    "    mu1_idx  = df[\"BPH_1Muon_genPartIdx\"]\n",
+    "    mu2_idx  = df[\"BPH_2Muon_genPartIdx\"]\n",
+    "    trk1_idx = df[\"Trk1_genPartIdx\"]\n",
+    "    trk2_idx = df[\"Trk2_genPartIdx\"]\n",
+    "\n",
+    "    # Verificação de Identidade (PDG ID)\n",
+    "    mu1_pdg  = df[\"BPHGenPart_pdgId\"][dak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mu2_pdg  = df[\"BPHGenPart_pdgId\"][dak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "\n",
+    "    flavor_match = (trk1_pdg == PDG_KAON_plus) & (trk2_pdg == PDG_PION_neg) & \\\n",
+    "                   (mu1_pdg == PDG_MUON_plus) & (mu2_pdg == PDG_MUON_neg)\n",
+    "\n",
+    "    # Linhagem do Hadron (K, Pi -> K* -> B0)\n",
+    "    mom_trk1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    mom_trk2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "    \n",
+    "    mom_trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    mom_trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    # K e Pi devem vir do mesmo objeto K*0 \n",
+    "    match_kstar = (mom_trk1_idx == mom_trk2_idx) & (mom_trk1_idx >= 0) & \\\n",
+    "                  (mom_trk1_pdg == PDG_KSTAR) & (mom_trk2_pdg == PDG_KSTAR)\n",
+    "    \n",
+    "    # O K*0 deve vir de um B0 (Verificando para ambos os traços)\n",
+    "    gmom_trk1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    gmom_trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(gmom_trk1_idx, gmom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(gmom_trk2_idx, gmom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    match_kstar_to_b0 = (gmom_trk1_idx == gmom_trk2_idx) & (gmom_trk1_idx >= 0) & \\\n",
+    "                        (gmom_trk1_pdg == PDG_B0) & (gmom_trk2_pdg == PDG_B0)\n",
+    "\n",
+    "    mom_mu1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mom_mu2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    mom_mu1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    mom_mu2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]\n",
+    "    \n",
+    "    gmom_mu1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    gmom_mu2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]\n",
+    "\n",
+    "    # Muon 1: Mãe é o B0 do hadron OU (Mãe é fóton e Avô é o B0 do hadron)\n",
+    "    mu1_from_same_b0 = (mom_mu1_idx == gmom_trk1_idx) | \\\n",
+    "                       ((mom_mu1_pdg == PDG_PHOTON) & (gmom_mu1_idx == gmom_trk1_idx))\n",
+    "\n",
+    "    mu2_from_same_b0 = (mom_mu2_idx == gmom_trk1_idx) | \\\n",
+    "                       ((mom_mu2_pdg == PDG_PHOTON) & (gmom_mu2_idx == gmom_trk1_idx))\n",
+    "\n",
+    "    # --- Máscara Final ---\n",
+    "    full_mask = flavor_match & match_kstar & match_kstar_to_b0 & \\\n",
+    "                mu1_from_same_b0 & mu2_from_same_b0\n",
+    "    \n",
+    "    return ak.fill_none(full_mask, False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9835455d-59a5-4f0e-b15d-4b83d17106f2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def apply_selection(df):\n",
+    "    mask = (        \n",
+    "        # --- Veto de Ressonâncias (J/psi e psi(2S)) ---\n",
+    "        (((df['MuMu_mass'] > 1.0) & (df['MuMu_mass'] < 2.7)) | \n",
+    "         ((df['MuMu_mass'] > 4.0) & (df['MuMu_mass'] < 6.0))) & \n",
+    "        \n",
+    "        # --- Seleção do K*0 (892) ---\n",
+    "        (abs(df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] - 0.892) <= 0.150) & \n",
+    "        (abs(df['BToTrkTrkMuMu_fit_ditrack_mass_piK'] - 0.892) <= 0.150) & \n",
+    "        (df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] < df['BToTrkTrkMuMu_fit_ditrack_mass_piK']) & \n",
+    "        \n",
+    "        # --- Aceitação dos Múons ---\n",
+    "        (df['BPH_1Muon_pt'] > 4.0) & (df['BPH_2Muon_pt'] > 4.0) & \n",
+    "        (abs(df['BPH_1Muon_eta']) < 2.5) & (abs(df['BPH_2Muon_eta']) < 2.5)\n",
+    "    )\n",
+    "    \n",
+    "    return ak.fill_none(mask, False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "b5b6ea07-555e-4328-abc6-d8148d42d19c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with ProgressBar():\n",
+    "    rare_mask = get_perfect_b0_matter_mask(df)\n",
+    "    kin_mask = apply_selection(df)\n",
+    "    final_mask = rare_mask & kin_mask\n",
+    "    clean_mass = df[\"BToTrkTrkMuMu_fit_mass_Kpi\"][final_mask]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4fa31802-4d59-48cd-b61d-c0f507ec56d8",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(10, 7))\n",
+    "data = ak.to_numpy(ak.flatten(clean_mass.compute(), axis=None))\n",
+    "plt.hist(data, bins=50, histtype='step',range=(5.0, 5.6), lw=2, color='red', label='B0 Rare Signal (Truth)')\n",
+    "plt.xlabel(r\"$m_{K\\pi}$ [GeV]\")\n",
+    "plt.ylabel(\"Events\")\n",
+    "plt.legend()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "0bdb2d16-6c1e-4cc8-b0b2-2133d806eb9f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mass_min, mass_max = 5.0, 5.6\n",
+    "obs = zfit.Space(\"m_b\", limits=(mass_min, mass_max))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "ad330b1f-67ff-416a-ab7a-704c19632f62",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mu    = zfit.Parameter(\"mu\", 5.279, 5.2, 5.4)\n",
+    "sigma = zfit.Parameter(\"sigma\", 0.02, 0.001, 0.1)\n",
+    "alphal = zfit.Parameter(\"alphal\", 1.5, 0.1, 5.0)\n",
+    "nl     = zfit.Parameter(\"nl\", 2.0, 0.1, 30.0)\n",
+    "alphar = zfit.Parameter(\"alphar\", 1.5, 0.1, 5.0)\n",
+    "nr     = zfit.Parameter(\"nr\", 2.0, 0.1, 30.0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "025ae31d-4dcb-4f55-9b07-b8662ea93f03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model = zfit.pdf.DoubleCB(obs=obs, mu=mu, sigma=sigma, \n",
+    "                          alphal=alphal, nl=nl, alphar=alphar, nr=nr\n",
+    "                          )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f3464c35-8738-4f1a-8c6f-1fab30278c42",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "zfit_data = zfit.Data.from_numpy(obs=obs, array=data)\n",
+    "nll = zfit.loss.UnbinnedNLL(model=model, data=zfit_data)\n",
+    "minimizer = zfit.minimize.Minuit()\n",
+    "result = minimizer.minimize(nll)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1bf969c6-91b9-47e4-9ca8-0fa136da6a90",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "result.errors()\n",
+    "print(f\"Fit Convergiu? {result.converged}\")\n",
+    "print(result)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "fc51815b-bf28-4459-9ecd-fed959c36fb2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(10, 7))\n",
+    "num_bins = 80\n",
+    "counts, bin_edges = np.histogram(data, bins=num_bins, range=(mass_min, mass_max))\n",
+    "bin_width = (mass_max - mass_min) / num_bins\n",
+    "\n",
+    "x_plot = np.linspace(mass_min, mass_max, 1000)\n",
+    "y_plot = model.pdf(x_plot).numpy() * len(data) * bin_width\n",
+    "\n",
+    "hep.histplot(counts, bins=bin_edges, color='black', label='MC Signal', histtype='errorbar')\n",
+    "plt.plot(x_plot, y_plot, color='darkred', lw=3, label='DoubleCB Fit')\n",
+    "\n",
+    "plt.xlabel(r\"$m(K\\pi\\mu\\mu)$ [GeV]\")\n",
+    "plt.ylabel(f\"Events / {bin_width:.3f} GeV\")\n",
+    "plt.legend()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f9dc75d6-024f-471e-8822-d8bdc0af9a5b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cov_matrix = result.covariance()\n",
+    "print(\"Matriz de Covariância:\")\n",
+    "print(cov_matrix)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "a3b06f1b-f767-48e6-aa5a-bebdff135f60",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "nll_value = result.fmin\n",
+    "print(f\"Log-Likelihood mínimo: {nll_value:.2f}\")\n",
+    "\n",
+    "\n",
+    "counts, bin_edges = np.histogram(data, bins=80, range=(5.0, 5.6))\n",
+    "bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2\n",
+    "bin_width = bin_edges[1] - bin_edges[0]\n",
+    "\n",
+    "expected_counts = model.pdf(bin_centers).numpy() * len(data) * bin_width\n",
+    "mask = counts > 0\n",
+    "chi2 = np.sum(((counts[mask] - expected_counts[mask])**2) / expected_counts[mask])\n",
+    "n_params = len(result.params)\n",
+    "ndf = len(counts) - n_params\n",
+    "\n",
+    "print(f\"Chi2: {chi2:.2f}\")\n",
+    "print(f\"NDF: {ndf}\")\n",
+    "print(f\"Chi2/NDF: {chi2/ndf:.2f}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1afa87b8-95fe-4ec3-9e6b-47b3fea37219",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "edm = result.edm\n",
+    "print(f\"EDM (Estimated Distance to Minimum): {edm:.6f}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "97618321-2c1f-4af4-a4a3-8fe1cae3852d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "res_raw = result.info['original']\n",
+    "fmin = res_raw.fmin if hasattr(res_raw, 'fmin') else res_raw\n",
+    "\n",
+    "print(f\"--- STATUS DO MINUIT (covQ) ---\")\n",
+    "print(f\"1. Fit Convergiu (Migrad):    {fmin.is_valid}\")\n",
+    "print(f\"2. Matriz de Covariância:     {fmin.has_covariance}\")\n",
+    "print(f\"3. Matriz é Precisa (covQ=3): {fmin.has_accurate_covar}\")\n",
+    "print(f\"4. EDM (Distância ao Mínimo): {fmin.edm:.6f}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e4812952-649a-496d-84bd-c60788e95d12",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# --- 1. Extração dos Parâmetros do Modelo ---\n",
+    "mu_val = model.params['mu'].numpy()\n",
+    "sigma_val = model.params['sigma'].numpy()\n",
+    "\n",
+    "# Definição das fronteiras para o sombreamento no plot principal\n",
+    "sig_low, sig_high = mu_val - 3*sigma_val, mu_val + 3*sigma_val\n",
+    "bg_neg_low, bg_neg_high = mu_val - 7*sigma_val, mu_val - 3*sigma_val\n",
+    "bg_pos_low, bg_pos_high = mu_val + 3*sigma_val, mu_val + 7*sigma_val\n",
+    "\n",
+    "# --- 2. Configuração do Gráfico (Grid com 2 subplots) ---\n",
+    "fig = plt.figure(figsize=(10, 10))\n",
+    "gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.05) \n",
+    "ax1 = plt.subplot(gs[0])\n",
+    "ax2 = plt.subplot(gs[1])\n",
+    "\n",
+    "# --- 3. Subplot Superior: Dados, Fit e Shading ---\n",
+    "hep.histplot(counts, bins=bin_edges, ax=ax1, color='black', label='MC Signal', histtype='errorbar')\n",
+    "ax1.plot(x_plot, y_plot, color='red', lw=3, label='DoubleCB Fit')\n",
+    "\n",
+    "# Sombreamento Vertical apenas no ax1\n",
+    "ax1.axvspan(sig_low, sig_high, color='red', alpha=0.15, label=r'Signal Region ($\\pm 3\\sigma$)')\n",
+    "ax1.axvspan(bg_neg_low, bg_neg_high, color='gray', alpha=0.2, label=r'Sidebands ($3-7\\sigma$)')\n",
+    "ax1.axvspan(bg_pos_low, bg_pos_high, color='gray', alpha=0.2)\n",
+    "\n",
+    "# Estética ax1\n",
+    "ax1.set_ylabel(f\"Events / {bin_width:.3f} GeV\", fontsize=18)\n",
+    "#ax1.set_xlim(bin_range)\n",
+    "ax1.set_ylim(0, max(counts) * 1.5) \n",
+    "ax1.legend(loc='upper right', fontsize=12, frameon=True)\n",
+    "hep.cms.label(\"Work in Progress\", data=False, year=\"2022\", ax=ax1, com=13.6, fontsize=20)\n",
+    "ax1.tick_params(axis='x', labelbottom=False)\n",
+    "\n",
+    "# --- 4. Subplot Inferior: Pull Plot (Original) ---\n",
+    "pulls = (counts - expected) / np.sqrt(counts, where=counts>0)\n",
+    "ax2.errorbar(bin_centers, pulls, yerr=1, fmt='o', color='black', markersize=4, capsize=0)\n",
+    "ax2.axhline(0, color='red', linestyle='-', lw=1)\n",
+    "\n",
+    "# Faixas de sigma do Pull (Verde/Amarelo)\n",
+    "ax2.fill_between(bin_range, -1, 1, color='green', alpha=0.2)\n",
+    "ax2.fill_between(bin_range, -2, 2, color='yellow', alpha=0.1)\n",
+    "\n",
+    "ax2.set_xlabel(r\"$m(K^{+}\\pi^{-}\\mu^{+}\\mu^{-})$ [GeV]\", fontsize=18)\n",
+    "ax2.set_ylabel(\"Pull\", fontsize=18)\n",
+    "ax2.set_ylim(-5, 5)\n",
+    "ax2.set_xlim(bin_range)\n",
+    "ax2.grid(axis='y', linestyle=':', alpha=0.6)\n",
+    "\n",
+    "plt.subplots_adjust(left=0.15, right=0.95, top=0.95, bottom=0.12)\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "11dde5ed-da20-4da3-ada8-61c37cb616a7",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d2875daa-475e-4e57-b7b4-f9b87e5e5e81",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e522e56e-8fd3-4695-9765-a90aa47d7ad4",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

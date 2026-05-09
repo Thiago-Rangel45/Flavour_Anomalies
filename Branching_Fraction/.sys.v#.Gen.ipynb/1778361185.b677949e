@@ -1,0 +1,242 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "449e498b-03db-45cf-8410-b093a5331a4d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import uproot\n",
+    "import dask_awkward as dak\n",
+    "import awkward as ak\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import vector\n",
+    "from dask.diagnostics import ProgressBar"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "3af32a85-41d7-4df1-ad29-5d8a59723cad",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "vector.register_awkward()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "d04869b9-d54f-4bb3-b1af-153232d419b1",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ==============================================================================\n",
+    "# 1. TRUTH MATCHING (Filtro de Eventos e Identificação de Partículas)\n",
+    "# ==============================================================================\n",
+    "def apply_truth_match(df):\n",
+    "    \"\"\"\n",
+    "    Recebe o 'dataframe' Awkward, identifica os eventos de sinal,\n",
+    "    e FILTRA as partículas de cada evento mantendo APENAS as que pertencem ao sinal.\n",
+    "    \"\"\"\n",
+    "    pdg = df[\"BPHGenPart_pdgId\"]\n",
+    "    mother = df[\"BPHGenPart_genPartIdxMother\"]\n",
+    "    local_idx = ak.local_index(pdg)\n",
+    "\n",
+    "    safe_mom = ak.where(mother >= 0, mother, 0)\n",
+    "    mom_pdg  = pdg[safe_mom]\n",
+    "    mom_pdg  = ak.where(mother >= 0, mom_pdg, -999)\n",
+    "\n",
+    "    safe_grandmom = safe_mom[safe_mom]\n",
+    "    grandmom_pdg  = pdg[safe_grandmom]\n",
+    "    grandmom_pdg  = ak.where(safe_mom >= 0, grandmom_pdg, -999)\n",
+    "\n",
+    "    B_ancestor_idx = ak.full_like(pdg, -1)\n",
+    "    B_ancestor_idx = ak.where((pdg == 511), local_idx, B_ancestor_idx)\n",
+    "    B_ancestor_idx = ak.where((pdg == 313) & (mom_pdg == 511), safe_mom, B_ancestor_idx)\n",
+    "    B_ancestor_idx = ak.where((pdg == 22)  & (mom_pdg == 511), safe_mom, B_ancestor_idx)\n",
+    "\n",
+    "    is_K    = (pdg == 321)  & (mom_pdg == 313) & (grandmom_pdg == 511)\n",
+    "    is_pi   = (pdg == -211) & (mom_pdg == 313) & (grandmom_pdg == 511)\n",
+    "    is_mu_m = (pdg == 13)   & (mom_pdg == 22)  & (grandmom_pdg == 511)\n",
+    "    is_mu_p = (pdg == -13)  & (mom_pdg == 22)  & (grandmom_pdg == 511)\n",
+    "\n",
+    "    B_ancestor_idx = ak.where(is_K,               safe_grandmom, B_ancestor_idx)\n",
+    "    B_ancestor_idx = ak.where(is_pi,              safe_grandmom, B_ancestor_idx)\n",
+    "    B_ancestor_idx = ak.where(is_mu_m | is_mu_p,  safe_grandmom, B_ancestor_idx)\n",
+    "\n",
+    "    anc_kstar = B_ancestor_idx[(pdg == 313) & (mom_pdg == 511)]\n",
+    "    anc_K     = B_ancestor_idx[is_K]\n",
+    "    anc_pi    = B_ancestor_idx[is_pi]\n",
+    "    anc_mu_m  = B_ancestor_idx[is_mu_m]\n",
+    "    anc_mu_p  = B_ancestor_idx[is_mu_p]\n",
+    "\n",
+    "    p_anc = B_ancestor_idx[:, :, np.newaxis]\n",
+    "\n",
+    "    has_1_kstar = ak.sum(p_anc == anc_kstar[:, np.newaxis, :], axis=-1) == 1\n",
+    "    has_1_K     = ak.sum(p_anc == anc_K[:, np.newaxis, :],     axis=-1) == 1\n",
+    "    has_1_pi    = ak.sum(p_anc == anc_pi[:, np.newaxis, :],    axis=-1) == 1\n",
+    "    has_1_mu_m  = ak.sum(p_anc == anc_mu_m[:, np.newaxis, :],  axis=-1) == 1\n",
+    "    has_1_mu_p  = ak.sum(p_anc == anc_mu_p[:, np.newaxis, :],  axis=-1) == 1\n",
+    "\n",
+    "    is_valid_chain  = has_1_kstar & has_1_K & has_1_pi & has_1_mu_m & has_1_mu_p\n",
+    "    particle_mask   = is_valid_chain & (B_ancestor_idx >= 0)\n",
+    "    event_has_signal = ak.sum(particle_mask, axis=1) > 0\n",
+    "\n",
+    "    # Sobrescreve as colunas BPHGenPart_ mantendo APENAS as partículas do sinal\n",
+    "    for col in df.fields:\n",
+    "        if col.startswith(\"BPHGenPart_\"):\n",
+    "            df[col] = df[col][particle_mask]\n",
+    "\n",
+    "    # Retorna apenas os eventos que possuem o sinal\n",
+    "    return df[event_has_signal]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "0b2f8b8f-8f06-4c3a-9dfb-9ae172dfa528",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ==============================================================================\n",
+    "# 2. SELEÇÃO E ACEITAÇÃO\n",
+    "# ==============================================================================\n",
+    "def apply_selection(df):\n",
+    "    \"\"\"\n",
+    "    Aplica cortes cinemáticos. Como aplicamos a máscara no passo anterior, \n",
+    "    todos os pdgs, pts e etas já são exclusivamente do decaimento de sinal.\n",
+    "    \"\"\"\n",
+    "    pdg = df[\"BPHGenPart_pdgId\"]\n",
+    "    pt  = df[\"BPHGenPart_pt\"]\n",
+    "    eta = df[\"BPHGenPart_eta\"]\n",
+    "\n",
+    "    # Identifica múons e hádrons\n",
+    "    is_mu = (abs(pdg) == 13)\n",
+    "    is_h  = ((abs(pdg) == 321) | (abs(pdg) == 211))\n",
+    "\n",
+    "    # Aplica os cortes \n",
+    "    mu_pass = is_mu & (pt > 2.0) & (abs(eta) < 2.4)\n",
+    "    h_pass  = is_h  & (pt > 1.5) & (abs(eta) < 2.4)\n",
+    "\n",
+    "    # O evento só sobrevive se os 2 múons e os 2 hádrons passaram no corte\n",
+    "    event_pass = (ak.sum(mu_pass, axis=1) == 2) & (ak.sum(h_pass, axis=1) == 2)\n",
+    "\n",
+    "    return df[event_pass]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "cd1d80a5-2f79-4a89-8e52-e8cb4a13a0d4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ==============================================================================\n",
+    "# 3. CÁLCULO DE MASSA INVARIANTE (q^2)\n",
+    "# ==============================================================================\n",
+    "def calculate_q2(df):\n",
+    "    \"\"\"\n",
+    "    Constrói os quadrivetores dos múons e calcula a massa invariante q^2.\n",
+    "    \"\"\"\n",
+    "    # Identifica os múons (que agora sabemos que são do sinal)\n",
+    "    is_mu = (abs(df[\"BPHGenPart_pdgId\"]) == 13)\n",
+    "\n",
+    "    # Empacota no formato que a biblioteca vector reconhece\n",
+    "    muons_4v = ak.zip(\n",
+    "        {\n",
+    "            \"pt\":   df[\"BPHGenPart_pt\"][is_mu],\n",
+    "            \"eta\":  df[\"BPHGenPart_eta\"][is_mu],\n",
+    "            \"phi\":  df[\"BPHGenPart_phi\"][is_mu],\n",
+    "            \"mass\": df[\"BPHGenPart_mass\"][is_mu]\n",
+    "        },\n",
+    "        with_name=\"Momentum4D\"\n",
+    "    )\n",
+    "\n",
+    "    # Soma os dois múons (índice 0 e índice 1 de cada evento)\n",
+    "    dimuon = muons_4v[:, 0] + muons_4v[:, 1]\n",
+    "\n",
+    "    # Cria a coluna q2 no dataframe\n",
+    "    df[\"q\"] = dimuon.mass\n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "3c3c8994-3978-42bd-844a-0a229d65eb28",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Lendo arquivos e montando o grafo Lazy...\n"
+     ]
+    },
+    {
+     "ename": "FileNotFoundError",
+     "evalue": "file not found\n\n    {'root://xrootd2.hepgrid.uerj.br:1094//cms/store/user/tdeandra/BPH_NanoAOD_MC/BdtoKstar2Mu_KstartoKPi_TuneCP5_13p6TeV_pythia8-evtgen/BPH_Nano_MC_BdtoKstarMuMu_NoFilter_2022/260427_132612/0000/*.root': 'Events'}\n\nFiles may be specified as:\n   * str/bytes: relative or absolute filesystem path or URL, without any colons\n         other than Windows drive letter or URL schema.\n         Examples: \"rel/file.root\", \"C:\\abs\\file.root\", \"http://where/what.root\"\n   * str/bytes: same with an object-within-ROOT path, separated by a colon.\n         Example: \"rel/file.root:tdirectory/ttree\"\n   * pathlib.Path: always interpreted as a filesystem path or URL only (no\n         object-within-ROOT path), regardless of whether there are any colons.\n         Examples: Path(\"rel:/file.root\"), Path(\"/abs/path:stuff.root\")\n\nFunctions that accept many files (uproot.iterate, etc.) also allow:\n   * glob syntax in str/bytes and pathlib.Path.\n         Examples: Path(\"rel/*.root\"), \"/abs/*.root:tdirectory/ttree\"\n   * dict: keys are filesystem paths, values are objects-within-ROOT paths.\n         Example: {\"/data_v1/*.root\": \"ttree_v1\", \"/data_v2/*.root\": \"ttree_v2\"}\n   * already-open TTree objects.\n   * iterables of the above.\n",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mFileNotFoundError\u001b[0m                         Traceback (most recent call last)",
+      "Cell \u001b[0;32mIn[7], line 8\u001b[0m\n\u001b[1;32m      5\u001b[0m file_path \u001b[38;5;241m=\u001b[39m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124m/cms/store/user/tdeandra/BPH_NanoAOD_MC/BdtoKstar2Mu_KstartoKPi_TuneCP5_13p6TeV_pythia8-evtgen/BPH_Nano_MC_BdtoKstarMuMu_NoFilter_2022/260427_132612/0000/*.root\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[1;32m      7\u001b[0m \u001b[38;5;28mprint\u001b[39m(\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mLendo arquivos e montando o grafo Lazy...\u001b[39m\u001b[38;5;124m\"\u001b[39m)\n\u001b[0;32m----> 8\u001b[0m df \u001b[38;5;241m=\u001b[39m \u001b[43muproot\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mdask\u001b[49m\u001b[43m(\u001b[49m\n\u001b[1;32m      9\u001b[0m \u001b[43m    \u001b[49m\u001b[43m{\u001b[49m\u001b[43mredirecionador\u001b[49m\u001b[43m \u001b[49m\u001b[38;5;241;43m+\u001b[39;49m\u001b[43m \u001b[49m\u001b[43mfile_path\u001b[49m\u001b[43m:\u001b[49m\u001b[43m \u001b[49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[38;5;124;43mEvents\u001b[39;49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[43m}\u001b[49m\u001b[43m,\u001b[49m\n\u001b[1;32m     10\u001b[0m \u001b[43m    \u001b[49m\u001b[43mlibrary\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[38;5;124;43mak\u001b[39;49m\u001b[38;5;124;43m\"\u001b[39;49m\n\u001b[1;32m     11\u001b[0m \u001b[43m)\u001b[49m\n",
+      "File \u001b[0;32m/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/uproot/_dask.py:185\u001b[0m, in \u001b[0;36mdask\u001b[0;34m(files, filter_name, filter_typename, filter_branch, recursive, full_paths, step_size, steps_per_file, library, ak_add_doc, custom_classes, allow_missing, open_files, form_mapping, allow_read_errors_with_report, known_base_form, decompression_executor, interpretation_executor, **options)\u001b[0m\n\u001b[1;32m     31\u001b[0m \u001b[38;5;28;01mdef\u001b[39;00m \u001b[38;5;21mdask\u001b[39m(\n\u001b[1;32m     32\u001b[0m     files,\n\u001b[1;32m     33\u001b[0m     \u001b[38;5;241m*\u001b[39m,\n\u001b[0;32m   (...)\u001b[0m\n\u001b[1;32m     51\u001b[0m     \u001b[38;5;241m*\u001b[39m\u001b[38;5;241m*\u001b[39moptions,\n\u001b[1;32m     52\u001b[0m ):\n\u001b[1;32m     53\u001b[0m \u001b[38;5;250m    \u001b[39m\u001b[38;5;124;03m\"\"\"\u001b[39;00m\n\u001b[1;32m     54\u001b[0m \u001b[38;5;124;03m    Args:\u001b[39;00m\n\u001b[1;32m     55\u001b[0m \u001b[38;5;124;03m        files: See below.\u001b[39;00m\n\u001b[0;32m   (...)\u001b[0m\n\u001b[1;32m    182\u001b[0m \u001b[38;5;124;03m      array from ``TTrees``.\u001b[39;00m\n\u001b[1;32m    183\u001b[0m \u001b[38;5;124;03m    \"\"\"\u001b[39;00m\n\u001b[0;32m--> 185\u001b[0m     files \u001b[38;5;241m=\u001b[39m \u001b[43muproot\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43m_util\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mregularize_files\u001b[49m\u001b[43m(\u001b[49m\u001b[43mfiles\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43msteps_allowed\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43;01mTrue\u001b[39;49;00m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[38;5;241;43m*\u001b[39;49m\u001b[38;5;241;43m*\u001b[39;49m\u001b[43moptions\u001b[49m\u001b[43m)\u001b[49m\n\u001b[1;32m    187\u001b[0m     is_3arg \u001b[38;5;241m=\u001b[39m [\u001b[38;5;28mlen\u001b[39m(x) \u001b[38;5;241m==\u001b[39m \u001b[38;5;241m3\u001b[39m \u001b[38;5;28;01mfor\u001b[39;00m x \u001b[38;5;129;01min\u001b[39;00m files]\n\u001b[1;32m    188\u001b[0m     \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;28many\u001b[39m(is_3arg):\n",
+      "File \u001b[0;32m/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/uproot/_util.py:952\u001b[0m, in \u001b[0;36mregularize_files\u001b[0;34m(files, steps_allowed, **options)\u001b[0m\n\u001b[1;32m    949\u001b[0m             out[\u001b[38;5;241m-\u001b[39m\u001b[38;5;241m1\u001b[39m] \u001b[38;5;241m=\u001b[39m (\u001b[38;5;241m*\u001b[39mout[\u001b[38;5;241m-\u001b[39m\u001b[38;5;241m1\u001b[39m], maybe_steps)\n\u001b[1;32m    951\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;28mlen\u001b[39m(out) \u001b[38;5;241m==\u001b[39m \u001b[38;5;241m0\u001b[39m:\n\u001b[0;32m--> 952\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m _file_not_found(files)\n\u001b[1;32m    954\u001b[0m \u001b[38;5;28;01mreturn\u001b[39;00m out\n",
+      "\u001b[0;31mFileNotFoundError\u001b[0m: file not found\n\n    {'root://xrootd2.hepgrid.uerj.br:1094//cms/store/user/tdeandra/BPH_NanoAOD_MC/BdtoKstar2Mu_KstartoKPi_TuneCP5_13p6TeV_pythia8-evtgen/BPH_Nano_MC_BdtoKstarMuMu_NoFilter_2022/260427_132612/0000/*.root': 'Events'}\n\nFiles may be specified as:\n   * str/bytes: relative or absolute filesystem path or URL, without any colons\n         other than Windows drive letter or URL schema.\n         Examples: \"rel/file.root\", \"C:\\abs\\file.root\", \"http://where/what.root\"\n   * str/bytes: same with an object-within-ROOT path, separated by a colon.\n         Example: \"rel/file.root:tdirectory/ttree\"\n   * pathlib.Path: always interpreted as a filesystem path or URL only (no\n         object-within-ROOT path), regardless of whether there are any colons.\n         Examples: Path(\"rel:/file.root\"), Path(\"/abs/path:stuff.root\")\n\nFunctions that accept many files (uproot.iterate, etc.) also allow:\n   * glob syntax in str/bytes and pathlib.Path.\n         Examples: Path(\"rel/*.root\"), \"/abs/*.root:tdirectory/ttree\"\n   * dict: keys are filesystem paths, values are objects-within-ROOT paths.\n         Example: {\"/data_v1/*.root\": \"ttree_v1\", \"/data_v2/*.root\": \"ttree_v2\"}\n   * already-open TTree objects.\n   * iterables of the above.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ==============================================================================\n",
+    "# 4. EXECUÇÃO DO PIPELINE (O \"Main\")\n",
+    "# ==============================================================================\n",
+    "redirecionador = \"root://xrootd2.hepgrid.uerj.br:1094/\"\n",
+    "\n",
+    "# Tente sem a primeira barra do /cms, pois o redirecionador já termina em /\n",
+    "file_path = \"cms/store/user/tdeandra/BPH_NanoAOD_MC/BdtoKstar2Mu_KstartoKPi_TuneCP5_13p6TeV_pythia8-evtgen/BPH_Nano_MC_BdtoKstarMuMu_NoFilter_2022/260427_132612/0000/*.root\"\n",
+    "print(\"Lendo arquivos e montando o grafo Lazy...\")\n",
+    "df = uproot.dask(\n",
+    "    {redirecionador + file_path: \"Events\"},\n",
+    "    library=\"ak\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "63ce3da1-6526-4377-a36f-3cd309b8827f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = apply_truth_match(df)\n",
+    "df = apply_selection(df)\n",
+    "df = calculate_q2(df)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

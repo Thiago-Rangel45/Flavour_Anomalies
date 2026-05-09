@@ -1,0 +1,66 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "25cb22f8-9519-42e2-b15e-8b7ca12546e2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import uproot\n",
+    "import awkward as ak\n",
+    "import numpy as np\n",
+    "\n",
+    "tree = uproot.open(\"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_signal_2022.root:Events\")\n",
+    "data = tree.arrays([\"BPHGenPart_pdgId\", \"BPHGenPart_genPartIdxMother\", \"BPHGenPart_mass\"])\n",
+    "\n",
+    "pdg_id = data[\"BPHGenPart_pdgId\"]\n",
+    "mom_idx = data[\"BPHGenPart_genPartIdxMother\"]\n",
+    "mass = data[\"BPHGenPart_mass\"]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "433d084a-4535-4382-9bc4-2ed118fdab54",
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "for branche in tree.keys():\n",
+    "    if \"Gen\" in branche:\n",
+    "        print(branche)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "78f2aa8c-c743-42de-8525-5f0c11636ee1",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

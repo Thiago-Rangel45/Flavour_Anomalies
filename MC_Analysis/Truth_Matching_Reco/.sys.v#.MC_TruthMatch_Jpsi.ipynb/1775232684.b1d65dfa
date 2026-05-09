@@ -1,0 +1,128 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "860c7749-2d18-4982-bf69-a8650bf727f3",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import uproot\n",
+    "import dask_awkward as dak\n",
+    "import awkward as ak\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import mplhep as hep\n",
+    "from dask.diagnostics import ProgressBar"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "ad08199d-0a1f-4ffe-9c85-a22744116672",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.style.use(hep.style.CMS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "d0b1459c-56a9-4433-9a38-debba24de761",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mc_files = \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_jpsi_2022.root\"\n",
+    "file = uproot.open(mc_files)\n",
+    "tree = file[\"Events\"]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "f5ebeabb-c666-44c1-b95e-212f25f73f22",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "PDG_B0        =  511\n",
+    "PDG_KSTAR     =  313\n",
+    "PDG_KAON_plus =  321\n",
+    "PDG_PION_neg  = -211\n",
+    "PDG_PHOTON    =  22\n",
+    "PDG_JPSI      =  443\n",
+    "PDG_MUON_plus = -13\n",
+    "PDG_MUON_neg  =  13"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "b9c0dab2-2a37-478d-be2e-d775975063bd",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pdg_ids = tree[\"BPHGenPart_pdgId\"].array()\n",
+    "mom_idx = tree[\"BPHGenPart_genPartIdxMother\"].array()\n",
+    "\n",
+    "mu1_idx  = tree[\"BPH_1Muon_genPartIdx\"].array()\n",
+    "mu2_idx  = tree[\"BPH_2Muon_genPartIdx\"].array()\n",
+    "trk1_idx = tree[\"Trk1_genPartIdx\"].array()\n",
+    "trk2_idx = tree[\"Trk2_genPartIdx\"].array()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "e07ebc78-d91b-40e6-9ae3-4ba2c74b8154",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mu1_pdg  = pdg_ids[ak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "mu2_pdg  = pdg_ids[ak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "trk1_pdg = pdg_ids[ak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "trk2_pdg = pdg_ids[ak.mask(trk2_idx, trk2_idx >= 0)]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "57180f03-2058-4edb-a7c9-30d6d6d56813",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "flavor_match = (trk1_pdg == PDG_KAON_plus) & (trk2_pdg == PDG_PION_neg) & \\\n",
+    "               (mu1_pdg == PDG_MUON_plus) & (mu2_pdg == PDG_MUON_neg)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "6f53de3a-3a40-4303-b58e-86bf0d5e28c7",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

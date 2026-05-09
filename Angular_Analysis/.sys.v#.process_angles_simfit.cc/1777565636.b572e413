@@ -1,0 +1,141 @@
+#include <iostream>
+#include "TFile.h"
+#include "TTree.h"
+#include "TLorentzVector.h"
+#include "TVector3.h"
+#include "TRandom3.h"
+#include "RooRealVar.h"
+#include "RooDataSet.h"
+#include "RooWorkspace.h"
+
+using namespace RooFit;
+
+void process_angles_simfit() {
+    // 1. Abrir o arquivo gerado pelo Python
+    TFile* f_in = TFile::Open("Filtered_Gen_Kinematics.root", "READ");
+    if (!f_in || f_in->IsZombie()) {
+        std::cerr << "Erro ao abrir Filtered_Gen_Kinematics.root" << std::endl;
+        return;
+    }
+    TTree* tree = (TTree*)f_in->Get("Events");
+
+    // 2. Variáveis para ler a TTree
+    double B0_pt, B0_eta, B0_phi, B0_mass;
+    double Kst_pt, Kst_eta, Kst_phi, Kst_mass;
+    double mu1_pt, mu1_eta, mu1_phi, mu1_mass;
+    double mu2_pt, mu2_eta, mu2_phi, mu2_mass;
+    double K_pt, K_eta, K_phi, K_mass;
+    double pi_pt, pi_eta, pi_phi, pi_mass;
+
+    tree->SetBranchAddress("B0_pt", &B0_pt); tree->SetBranchAddress("B0_eta", &B0_eta); tree->SetBranchAddress("B0_phi", &B0_phi); tree->SetBranchAddress("B0_mass", &B0_mass);
+    tree->SetBranchAddress("Kst_pt", &Kst_pt); tree->SetBranchAddress("Kst_eta", &Kst_eta); tree->SetBranchAddress("Kst_phi", &Kst_phi); tree->SetBranchAddress("Kst_mass", &Kst_mass);
+    tree->SetBranchAddress("mu1_pt", &mu1_pt); tree->SetBranchAddress("mu1_eta", &mu1_eta); tree->SetBranchAddress("mu1_phi", &mu1_phi); tree->SetBranchAddress("mu1_mass", &mu1_mass);
+    tree->SetBranchAddress("mu2_pt", &mu2_pt); tree->SetBranchAddress("mu2_eta", &mu2_eta); tree->SetBranchAddress("mu2_phi", &mu2_phi); tree->SetBranchAddress("mu2_mass", &mu2_mass);
+    tree->SetBranchAddress("K_pt", &K_pt); tree->SetBranchAddress("K_eta", &K_eta); tree->SetBranchAddress("K_phi", &K_phi); tree->SetBranchAddress("K_mass", &K_mass);
+    tree->SetBranchAddress("pi_pt", &pi_pt); tree->SetBranchAddress("pi_eta", &pi_eta); tree->SetBranchAddress("pi_phi", &pi_phi); tree->SetBranchAddress("pi_mass", &pi_mass);
+
+    // 3. Preparar RooFit Variables
+    RooRealVar mass("mass", "mass", 5.0, 5.6);
+    RooRealVar ctK("ctK", "cos(#theta_{K})", -1.0, 1.0);
+    RooRealVar ctL("ctL", "cos(#theta_{L})", -1.0, 1.0);
+    RooRealVar phi("phi", "#phi", -TMath::Pi(), TMath::Pi());
+    RooRealVar rand("rand", "rand", 0.0, 1.0);
+    RooArgSet argset(mass, ctK, ctL, phi, rand);
+
+    // Arrays para guardar os datasets de cada bin
+    const int nBins = 9;
+    RooDataSet* base_datasets[nBins];
+    for (int i = 0; i < nBins; ++i) {
+        TString dsName = Form("ds_b%d", i);
+        base_datasets[i] = new RooDataSet(dsName, dsName, argset);
+    }
+
+    TRandom3 rand_gen(12345);
+    Long64_t nEntries = tree->GetEntries();
+    std::cout << "Processando " << nEntries << " eventos no C++..." << std::endl;
+
+    // 4. Loop sobre os eventos
+    for (Long64_t i = 0; i < nEntries; ++i) {
+        tree->GetEntry(i);
+
+        TLorentzVector pB0, pKst, pmu1, pmu2, pK, ppi;
+        pB0.SetPtEtaPhiM(B0_pt, B0_eta, B0_phi, B0_mass);
+        pKst.SetPtEtaPhiM(Kst_pt, Kst_eta, Kst_phi, Kst_mass);
+        pmu1.SetPtEtaPhiM(mu1_pt, mu1_eta, mu1_phi, mu1_mass);
+        pmu2.SetPtEtaPhiM(mu2_pt, mu2_eta, mu2_phi, mu2_mass);
+        pK.SetPtEtaPhiM(K_pt, K_eta, K_phi, K_mass);
+        ppi.SetPtEtaPhiM(pi_pt, pi_eta, pi_phi, pi_mass);
+
+        double q2 = (pmu1 + pmu2).M2();
+        int b = -1;
+        if (q2 >= 1.1 && q2 < 2.0) b = 0; 
+        else if (q2 >= 2.0 && q2 < 4.3) b = 1;
+        else if (q2 >= 4.3 && q2 < 6.0) b = 2; 
+        else if (q2 >= 6.0 && q2 < 8.68) b = 3;
+        else if (q2 >= 8.68 && q2 < 10.09) b = 4;
+        else if (q2 >= 10.09 && q2 < 12.86) b = 5;
+        else if (q2 >= 12.86 && q2 < 14.18) b = 6;
+        else if (q2 >= 14.18 && q2 < 16.0) b = 7;
+        else if (q2 >= 16.0 && q2 < 19.0) b = 8;
+        
+        if (b == -1) continue;
+
+        // Cálculos Angulares
+        TLorentzVector pmumu = pmu1 + pmu2;
+        TVector3 b_mumu = -pmumu.BoostVector();
+        TLorentzVector mu1_m = pmu1; mu1_m.Boost(b_mumu);
+        TLorentzVector b0_m = pB0; b0_m.Boost(b_mumu);
+        double val_ctL = mu1_m.Vect().Unit().Dot((-b0_m.Vect()).Unit());
+
+        TVector3 b_kst = -pKst.BoostVector();
+        TLorentzVector k_k = pK; k_k.Boost(b_kst);
+        TLorentzVector b0_k = pB0; b0_k.Boost(b_kst);
+        double val_ctK = k_k.Vect().Unit().Dot((-b0_k.Vect()).Unit());
+
+        TVector3 b_b0 = -pB0.BoostVector();
+        TLorentzVector mu1_b = pmu1; mu1_b.Boost(b_b0);
+        TLorentzVector mu2_b = pmu2; mu2_b.Boost(b_b0);
+        TLorentzVector k_b = pK; k_b.Boost(b_b0);
+        TLorentzVector pi_b = ppi; pi_b.Boost(b_b0);
+
+        TVector3 n_mumu = mu1_b.Vect().Cross(mu2_b.Vect()).Unit();
+        TVector3 n_Kpi  = k_b.Vect().Cross(pi_b.Vect()).Unit();
+        TVector3 z_axis = (k_b + pi_b).Vect().Unit();
+        double val_phi = atan2((n_mumu.Cross(n_Kpi)).Dot(z_axis), n_mumu.Dot(n_Kpi));
+
+        // Preenche o Dataset
+        ctK.setVal(val_ctK); 
+        ctL.setVal(val_ctL); 
+        phi.setVal(val_phi); 
+        mass.setVal(pB0.M()); 
+        rand.setVal(rand_gen.Uniform(1));
+        
+        base_datasets[b]->add(argset);
+    }
+
+    f_in->Close();
+
+    // 5. Salvar nos arquivos finais
+    for (int i = 0; i < nBins; ++i) {
+        if (base_datasets[i]->numEntries() == 0) continue;
+        
+        TString fileName = Form("effDataset_GENOnly_b%d.root", i);
+        TFile* f_out = new TFile(fileName, "RECREATE");
+
+        for (int p = 0; p < 2; ++p) { // Reproduz o seu loop de p=0 e p=1
+            TString wsName = Form("ws_b%dp%d", i, p);
+            RooWorkspace ws(wsName);
+            
+            TString nameEv = Form("data_genDen_ev_b%d", i);
+            TString nameOd = Form("data_genDen_od_b%d", i);
+            
+            ws.import(*base_datasets[i], RenameVariable("ctK","ctK"), Rename(nameEv));
+            ws.import(*base_datasets[i], RenameVariable("ctK","ctK"), Rename(nameOd));
+            
+            ws.Write();
+        }
+        
+        f_out->Close();
+        std::cout << "Arquivo " << fileName << " salvo com sucesso!" << std::endl;
+    }
+}

@@ -1,0 +1,159 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "TFile.h"
+#include "TTree.h"
+#include "TLorentzVector.h"
+#include "TVector3.h"
+#include "TRandom3.h"
+#include "TMath.h"
+#include "TString.h"
+#include "RooRealVar.h"
+#include "RooDataSet.h"
+#include "RooWorkspace.h"
+#include "RooArgSet.h"
+#include "RooAbsData.h"
+
+using namespace RooFit;
+
+void process_angles_simfit() {
+    // Garantir compatibilidade de armazenamento de dados entre versões do ROOT
+    RooAbsData::setDefaultStorageType(RooAbsData::Tree);
+
+    // 1. Abrir o arquivo de entrada
+    TFile* f_in = TFile::Open("Filtered_Gen_Kinematics_FSR.root", "READ");
+    if (!f_in || f_in->IsZombie()) {
+        std::cerr << "Erro ao abrir Filtered_Gen_Kinematics.root" << std::endl;
+        return;
+    }
+    TTree* tree = (TTree*)f_in->Get("Events");
+
+    // 2. Variáveis para leitura da TTree
+    float B0_pt, B0_eta, B0_phi, B0_mass;
+    float Kst_pt, Kst_eta, Kst_phi, Kst_mass;
+    float mu1_pt, mu1_eta, mu1_phi, mu1_mass;
+    float mu2_pt, mu2_eta, mu2_phi, mu2_mass; 
+    float K_pt, K_eta, K_phi, K_mass;
+    float pi_pt, pi_eta, pi_phi, pi_mass;
+
+    tree->SetBranchAddress("B0_pt", &B0_pt); tree->SetBranchAddress("B0_eta", &B0_eta); tree->SetBranchAddress("B0_phi", &B0_phi); tree->SetBranchAddress("B0_mass", &B0_mass);
+    tree->SetBranchAddress("Kst_pt", &Kst_pt); tree->SetBranchAddress("Kst_eta", &Kst_eta); tree->SetBranchAddress("Kst_phi", &Kst_phi); tree->SetBranchAddress("Kst_mass", &Kst_mass);
+    tree->SetBranchAddress("mu1_pt", &mu1_pt); tree->SetBranchAddress("mu1_eta", &mu1_eta); tree->SetBranchAddress("mu1_phi", &mu1_phi); tree->SetBranchAddress("mu1_mass", &mu1_mass);
+    tree->SetBranchAddress("mu2_pt", &mu2_pt); tree->SetBranchAddress("mu2_eta", &mu2_eta); tree->SetBranchAddress("mu2_phi", &mu2_phi); tree->SetBranchAddress("mu2_mass", &mu2_mass);
+    tree->SetBranchAddress("K_pt", &K_pt); tree->SetBranchAddress("K_eta", &K_eta); tree->SetBranchAddress("K_phi", &K_phi); tree->SetBranchAddress("K_mass", &K_mass);
+    tree->SetBranchAddress("pi_pt", &pi_pt); tree->SetBranchAddress("pi_eta", &pi_eta); tree->SetBranchAddress("pi_phi", &pi_phi); tree->SetBranchAddress("pi_mass", &pi_mass);
+
+    // 3. Preparar Variáveis RooFit
+    RooRealVar ctK("ctK", "ctK", -1, 1);
+    RooRealVar ctL("ctL", "ctL", -1, 1);
+    RooRealVar phi("phi", "phi", -TMath::Pi(), TMath::Pi());
+    RooRealVar rand("rand", "rand", 0, 1);
+    RooRealVar mass("mass", "mass", 5.0, 5.6);
+    RooArgSet argset(ctK, ctL, phi, rand, mass);
+
+    const int nBins = 9;
+    std::vector<RooDataSet*> base_datasets;
+    for (int i = 0; i < nBins; ++i) {
+        base_datasets.push_back(new RooDataSet(Form("tmp_b%d", i), "tmp", argset));
+    }
+
+    TRandom3 rand_gen(12345);
+    Long64_t nEntries = tree->GetEntries();
+    std::cout << "Processando " << nEntries << " eventos..." << std::endl;
+
+    // 4. Loop de Processamento
+    for (Long64_t i = 0; i < nEntries; ++i) {
+        tree->GetEntry(i);
+
+        TLorentzVector pB0, pKst, pmu1, pmu2, pK, ppi;
+        pB0.SetPtEtaPhiM(B0_pt, B0_eta, B0_phi, B0_mass);
+        pKst.SetPtEtaPhiM(Kst_pt, Kst_eta, Kst_phi, Kst_mass);
+        pmu1.SetPtEtaPhiM(mu1_pt, mu1_eta, mu1_phi, mu1_mass);
+        pmu2.SetPtEtaPhiM(mu2_pt, mu2_eta, mu2_phi, mu2_mass);
+        pK.SetPtEtaPhiM(K_pt, K_eta, K_phi, K_mass);
+        ppi.SetPtEtaPhiM(pi_pt, pi_eta, pi_phi, pi_mass);
+
+        double q2 = (pmu1 + pmu2).M2();
+        int b = -1;
+        if (q2 >= 1.1 && q2 < 2.0) b = 0; 
+        else if (q2 >= 2.0 && q2 < 4.3) b = 1;
+        else if (q2 >= 4.3 && q2 < 6.0) b = 2; 
+        else if (q2 >= 6.0 && q2 < 8.68) b = 3;
+        else if (q2 >= 8.68 && q2 < 10.09) b = 4;
+        else if (q2 >= 10.09 && q2 < 12.86) b = 5;
+        else if (q2 >= 12.86 && q2 < 14.18) b = 6;
+        else if (q2 >= 14.18 && q2 < 16.0) b = 7;
+        else if (q2 >= 16.0 && q2 < 19.0) b = 8;
+        
+        if (b == -1) continue;
+
+        // --- Cálculos Angulares com Proteção ---
+        TLorentzVector pmumu = pmu1 + pmu2;
+        TVector3 b_mumu = -pmumu.BoostVector();
+        TLorentzVector mu1_m = pmu1; mu1_m.Boost(b_mumu);
+        TLorentzVector b0_m = pB0; b0_m.Boost(b_mumu);
+        double val_ctL = mu1_m.Vect().Unit().Dot((-b0_m.Vect()).Unit());
+
+        TVector3 b_kst = -pKst.BoostVector();
+        TLorentzVector k_k = pK; k_k.Boost(b_kst);
+        TLorentzVector b0_k = pB0; b0_k.Boost(b_kst);
+        double val_ctK = k_k.Vect().Unit().Dot((-b0_k.Vect()).Unit());
+
+        TVector3 b_b0 = -pB0.BoostVector();
+        TLorentzVector mu1_b = pmu1; mu1_b.Boost(b_b0);
+        TLorentzVector mu2_b = pmu2; mu2_b.Boost(b_b0);
+        TLorentzVector k_b = pK; k_b.Boost(b_b0);
+        TLorentzVector pi_b = ppi; pi_b.Boost(b_b0);
+
+        TVector3 n_mumu = mu1_b.Vect().Cross(mu2_b.Vect());
+        TVector3 n_Kpi  = k_b.Vect().Cross(pi_b.Vect());
+        
+        // Proteção contra cross products nulos
+        if (n_mumu.Mag() == 0 || n_Kpi.Mag() == 0) continue;
+        
+        n_mumu = n_mumu.Unit();
+        n_Kpi  = n_Kpi.Unit();
+        TVector3 z_axis = (k_b + pi_b).Vect().Unit();
+        double val_phi = atan2((n_mumu.Cross(n_Kpi)).Dot(z_axis), n_mumu.Dot(n_Kpi));
+
+        // Filtro Final contra NANs antes de adicionar ao Dataset
+        if (std::isnan(val_ctK) || std::isnan(val_ctL) || std::isnan(val_phi)) continue;
+
+        ctK.setVal(val_ctK); 
+        ctL.setVal(val_ctL); 
+        phi.setVal(val_phi); 
+        mass.setVal(pB0.M()); 
+        rand.setVal(rand_gen.Uniform(1));
+        
+        base_datasets[b]->add(argset);
+    }
+    f_in->Close();
+
+    // 5. Exportação
+    for (int i = 0; i < nBins; ++i) {
+        if (base_datasets[i]->numEntries() == 0) continue;
+        
+        TString fileName = Form("./effDataset_GENOnly_b%d.root", i);
+        TFile* f_out = TFile::Open(fileName, "RECREATE");
+
+        for (int p = 0; p < 2; ++p) {
+            TString wsName = Form("ws_b%dp%d", i, p);
+            RooWorkspace ws(wsName);
+            
+            TString nameEv = Form("data_genDen_ev_b%d", i);
+            TString nameOd = Form("data_genDen_od_b%d", i);
+            
+            ws.import(*base_datasets[i], Rename(nameEv));
+            ws.import(*base_datasets[i], Rename(nameOd));
+            
+            ws.Write();
+        }
+        f_out->Close();
+        std::cout << "Bin " << i << " salva com sucesso em " << fileName << " (" << base_datasets[i]->numEntries() << " eventos)." << std::endl;
+    }
+}
+
+int main() {
+    process_angles_simfit();
+    return 0;
+}

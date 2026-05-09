@@ -1,0 +1,180 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "a61f4f36-c306-43e4-b8cb-ccba8fe4e629",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/zfit/__init__.py:93: UserWarning: TensorFlow warnings are by default suppressed by zfit. In order to show them, set the environment variable ZFIT_DISABLE_TF_WARNINGS=0. In order to suppress the TensorFlow warnings AND this warning, set ZFIT_DISABLE_TF_WARNINGS=1.\n",
+      "  warnings.warn(\n"
+     ]
+    }
+   ],
+   "source": [
+    "import uproot\n",
+    "import dask_awkward as dak\n",
+    "import awkward as ak\n",
+    "import zfit\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.gridspec as gridspec\n",
+    "import mplhep as hep\n",
+    "from dask.diagnostics import ProgressBar"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "21c91b03-185f-4d6d-b08a-c7967a71bd81",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.style.use(hep.style.CMS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "3431ccc1-d097-4372-9dcb-1c040cb0847f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mc_files = {\"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_jpsi_2022.root\": \"Events\"}\n",
+    "df = uproot.dask(mc_files)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "9b027394-fb29-450e-b117-d11af5a29817",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_perfect_b0_matter_mask(df):\n",
+    "    PDG_B0        =  511\n",
+    "    PDG_KSTAR     =  313\n",
+    "    PDG_KAON_plus =  321\n",
+    "    PDG_PION_neg  = -211\n",
+    "    PDG_PHOTON    =  22\n",
+    "    PDG_JPSI      =  443\n",
+    "    PDG_MUON_plus = -13\n",
+    "    PDG_MUON_neg  =  13\n",
+    "\n",
+    "    pdg_ids = tree[\"BPHGenPart_pdgId\"].array()\n",
+    "    mom_idx = tree[\"BPHGenPart_genPartIdxMother\"].array()\n",
+    "    \n",
+    "    mu1_idx  = tree[\"BPH_1Muon_genPartIdx\"].array()\n",
+    "    mu2_idx  = tree[\"BPH_2Muon_genPartIdx\"].array()\n",
+    "    trk1_idx = tree[\"Trk1_genPartIdx\"].array()\n",
+    "    trk2_idx = tree[\"Trk2_genPartIdx\"].array()\n",
+    "\n",
+    "    mu1_pdg  = pdg_ids[ak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mu2_pdg  = pdg_ids[ak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    trk1_pdg = pdg_ids[ak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    trk2_pdg = pdg_ids[ak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "\n",
+    "    flavor_match = (trk1_pdg == PDG_KAON_plus) & (trk2_pdg == PDG_PION_neg) & \\\n",
+    "                   (mu1_pdg == PDG_MUON_plus) & (mu2_pdg == PDG_MUON_neg)\n",
+    "\n",
+    "    mom_trk1_idx = mom_idx[ak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    mom_trk2_idx = mom_idx[ak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "    mom_trk1_pdg = pdg_ids[ak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    mom_trk2_pdg = pdg_ids[ak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]\n",
+    "\n",
+    "    match_kstar = (mom_trk1_idx == mom_trk2_idx) & (mom_trk1_idx >= 0) & (mom_trk2_idx >= 0) & \\\n",
+    "                  (mom_trk1_pdg == PDG_KSTAR) & (mom_trk2_pdg == PDG_KSTAR)\n",
+    "\n",
+    "    gmom_trk1_idx = mom_idx[ak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_idx = mom_idx[ak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]    \n",
+    "    gmom_trk1_pdg = pdg_ids[ak.mask(gmom_trk1_idx, gmom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_pdg = pdg_ids[ak.mask(gmom_trk2_idx, gmom_trk2_idx >= 0)]\n",
+    "\n",
+    "    match_kstar_to_b0 = (gmom_trk1_idx == gmom_trk2_idx) & (gmom_trk1_idx >= 0) & (gmom_trk2_idx >= 0) & \\\n",
+    "                        (gmom_trk1_pdg == PDG_B0) & (gmom_trk2_pdg == PDG_B0)\n",
+    "\n",
+    "    mom_mu1_idx = mom_idx[ak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mom_mu2_idx = mom_idx[ak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    gmom_mu1_idx = mom_idx[ak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    gmom_mu2_idx = mom_idx[ak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]\n",
+    "\n",
+    "    mom_mu1_pdg = pdg_ids[ak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    mom_mu2_pdg = pdg_ids[ak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]    \n",
+    "    gmom_mu1_pdg = pdg_ids[ak.mask(gmom_mu1_idx, gmom_mu1_idx >= 0)]\n",
+    "    gmom_mu2_pdg = pdg_ids[ak.mask(gmom_mu2_idx, gmom_mu2_idx >= 0)]\n",
+    "\n",
+    "    ggmom_mu1_idx = mom_idx[ak.mask(gmom_mu1_idx, gmom_mu1_idx >= 0)]\n",
+    "    ggmom_mu2_idx = mom_idx[ak.mask(gmom_mu2_idx, gmom_mu2_idx >= 0)]    \n",
+    "    ggmom_mu1_pdg = pdg_ids[ak.mask(ggmom_mu1_idx, ggmom_mu1_idx >= 0)]\n",
+    "    ggmom_mu2_pdg = pdg_ids[ak.mask(ggmom_mu2_idx, ggmom_mu2_idx >= 0)]\n",
+    "\n",
+    "    mu1_match = (mom_mu1_idx == gmom_trk1_idx) | \\\n",
+    "                ((mom_mu1_pdg == PDG_PHOTON) & (gmom_mu2_pdg == PDG_JPSI) & (ggmom_mu1_idx == gmom_trk1_idx))\n",
+    "\n",
+    "    mu2_match = (mom_mu2_idx == gmom_trk1_idx) | \\\n",
+    "            ((mom_mu2_pdg == PDG_PHOTON) & (gmom_mu2_pdg == PDG_JPSI) & (ggmom_mu2_idx == gmom_trk1_idx))\n",
+    "    truth_match_final = flavor_match & match_kstar & match_kstar_to_b0 & mu1_match & mu2_match\n",
+    "\n",
+    "    return ak.fill_none(truth_match_final, False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "8a41e31f-ae60-4208-8b7f-0e035463b941",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def apply_selection(df):\n",
+    "    mask = (        \n",
+    "        # --- Ressonância (J/psi) ---\n",
+    "        (((df['MuMu_mass'] > 2.9) & (df['MuMu_mass'] < 3.3))\n",
+    "        \n",
+    "        # --- Seleção do K*0 (892) ---\n",
+    "        (abs(df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] - 0.892) <= 0.150) & \n",
+    "        (abs(df['BToTrkTrkMuMu_fit_ditrack_mass_piK'] - 0.892) <= 0.150) & \n",
+    "        (df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] < df['BToTrkTrkMuMu_fit_ditrack_mass_piK']) & \n",
+    "        \n",
+    "        # --- Aceitação dos Múons ---\n",
+    "        (df['BPH_1Muon_pt'] > 4.0) & (df['BPH_2Muon_pt'] > 4.0) & \n",
+    "        (abs(df['BPH_1Muon_eta']) < 2.5) & (abs(df['BPH_2Muon_eta']) < 2.5)\n",
+    "    ))\n",
+    "    \n",
+    "    return ak.fill_none(mask, False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8d21fcd5-1886-4210-8622-fd0821dfec2c",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

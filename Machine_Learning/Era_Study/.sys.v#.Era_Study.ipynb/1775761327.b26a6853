@@ -1,0 +1,457 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "8e161a97-9676-4605-a984-1f1f35b711be",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/zfit/__init__.py:93: UserWarning: TensorFlow warnings are by default suppressed by zfit. In order to show them, set the environment variable ZFIT_DISABLE_TF_WARNINGS=0. In order to suppress the TensorFlow warnings AND this warning, set ZFIT_DISABLE_TF_WARNINGS=1.\n",
+      "  warnings.warn(\n"
+     ]
+    }
+   ],
+   "source": [
+    "import os\n",
+    "import json\n",
+    "import warnings\n",
+    "import joblib\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import awkward as ak\n",
+    "import dask_awkward as dak\n",
+    "from dask.diagnostics import ProgressBar\n",
+    "\n",
+    "import uproot\n",
+    "import zfit\n",
+    "from zfit.loss import UnbinnedNLL\n",
+    "from zfit.minimize import Minuit\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.gridspec as gridspec\n",
+    "import mplhep as hep\n",
+    "\n",
+    "import xgboost as xgb\n",
+    "from xgboost import XGBClassifier\n",
+    "\n",
+    "from sklearn.metrics import (\n",
+    "    roc_curve, \n",
+    "    auc, \n",
+    "    precision_recall_curve, \n",
+    "    average_precision_score, \n",
+    "    confusion_matrix,\n",
+    "    ConfusionMatrixDisplay, \n",
+    "    classification_report, \n",
+    "    accuracy_score, \n",
+    "    f1_score\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "a7acc0b2-791e-4f58-ade5-e6523f65eefb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.style.use(hep.style.CMS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "10d067e0-07d6-4db7-9f11-5f54b3e14efb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tree_path = \"Events\"\n",
+    "mc_files_EE = {f: tree_path for f in [\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_signal_2022EE.root\"\n",
+    "]}\n",
+    "mc_files = {f: tree_path for f in [\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_mc_signal_2022.root\"\n",
+    "]}\n",
+    "\n",
+    "data_files_EE = {f: tree_path for f in [\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_dados_Run2022E.root\",\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_dados_Run2022F.root\",\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_dados_Run2022G.root\"\n",
+    "]}\n",
+    "\n",
+    "data_files = {f: tree_path for f in [\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_dados_Run2022C.root\",\n",
+    "    \"/eos/user/t/tdeandra/skim_outputs/Merged_Eras/Merged_dados_Run2022D.root\",\n",
+    "]}"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "abc13d62-3405-4a65-a976-73f37ac1bed9",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_b0_truth_mask(df):\n",
+    "    # --- 1. Constantes PDG ---\n",
+    "    PDG_B0        = 511\n",
+    "    PDG_KSTAR     = 313\n",
+    "    PDG_KAON_plus = 321\n",
+    "    PDG_PION_neg  = -211\n",
+    "    PDG_MUON_plus = -13\n",
+    "    PDG_MUON_neg  = 13\n",
+    "    PDG_PHOTON    = 22\n",
+    "\n",
+    "    mu1_idx  = df[\"BPH_1Muon_genPartIdx\"]\n",
+    "    mu2_idx  = df[\"BPH_2Muon_genPartIdx\"]\n",
+    "    trk1_idx = df[\"Trk1_genPartIdx\"]\n",
+    "    trk2_idx = df[\"Trk2_genPartIdx\"]\n",
+    "\n",
+    "    # Verificação de Identidade (PDG ID)\n",
+    "    mu1_pdg  = df[\"BPHGenPart_pdgId\"][dak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mu2_pdg  = df[\"BPHGenPart_pdgId\"][dak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "\n",
+    "    flavor_match = (trk1_pdg == PDG_KAON_plus) & (trk2_pdg == PDG_PION_neg) & \\\n",
+    "                   (mu1_pdg == PDG_MUON_plus) & (mu2_pdg == PDG_MUON_neg)\n",
+    "\n",
+    "    # Linhagem do Hadron (K, Pi -> K* -> B0)\n",
+    "    mom_trk1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(trk1_idx, trk1_idx >= 0)]\n",
+    "    mom_trk2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(trk2_idx, trk2_idx >= 0)]\n",
+    "    \n",
+    "    mom_trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    mom_trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    # K e Pi devem vir do mesmo objeto K*0 \n",
+    "    match_kstar = (mom_trk1_idx == mom_trk2_idx) & (mom_trk1_idx >= 0) & \\\n",
+    "                  (mom_trk1_pdg == PDG_KSTAR) & (mom_trk2_pdg == PDG_KSTAR)\n",
+    "    \n",
+    "    # O K*0 deve vir de um B0 (Verificando para ambos os traços)\n",
+    "    gmom_trk1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_trk1_idx, mom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_trk2_idx, mom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    gmom_trk1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(gmom_trk1_idx, gmom_trk1_idx >= 0)]\n",
+    "    gmom_trk2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(gmom_trk2_idx, gmom_trk2_idx >= 0)]\n",
+    "    \n",
+    "    match_kstar_to_b0 = (gmom_trk1_idx == gmom_trk2_idx) & (gmom_trk1_idx >= 0) & \\\n",
+    "                        (gmom_trk1_pdg == PDG_B0) & (gmom_trk2_pdg == PDG_B0)\n",
+    "\n",
+    "    mom_mu1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mu1_idx, mu1_idx >= 0)]\n",
+    "    mom_mu2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mu2_idx, mu2_idx >= 0)]\n",
+    "    mom_mu1_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    mom_mu2_pdg = df[\"BPHGenPart_pdgId\"][dak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]\n",
+    "    \n",
+    "    gmom_mu1_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_mu1_idx, mom_mu1_idx >= 0)]\n",
+    "    gmom_mu2_idx = df[\"BPHGenPart_genPartIdxMother\"][dak.mask(mom_mu2_idx, mom_mu2_idx >= 0)]\n",
+    "\n",
+    "    # Muon 1: Mãe é o B0 do hadron OU (Mãe é fóton e Avô é o B0 do hadron)\n",
+    "    mu1_from_same_b0 = (mom_mu1_idx == gmom_trk1_idx) | \\\n",
+    "                       ((mom_mu1_pdg == PDG_PHOTON) & (gmom_mu1_idx == gmom_trk1_idx))\n",
+    "\n",
+    "    mu2_from_same_b0 = (mom_mu2_idx == gmom_trk1_idx) | \\\n",
+    "                       ((mom_mu2_pdg == PDG_PHOTON) & (gmom_mu2_idx == gmom_trk1_idx))\n",
+    "\n",
+    "    # --- Máscara Final ---\n",
+    "    full_mask = flavor_match & match_kstar & match_kstar_to_b0 & \\\n",
+    "                mu1_from_same_b0 & mu2_from_same_b0\n",
+    "    \n",
+    "    return ak.fill_none(full_mask, False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "05faca71-4ec0-4784-ac89-80379c48d9c6",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def add_derived_columns(df):\n",
+    "    df[\"BToTrkTrkMuMu_l_xy_sig\"] = df['BToTrkTrkMuMu_l_xy'] / df['BToTrkTrkMuMu_l_xy_unc']\n",
+    "    df[\"BToTrkTrkMuMu_dca_sig\"]  = df['BToTrkTrkMuMu_dca'] / df['BToTrkTrkMuMu_dcaErr']\n",
+    "    df[\"BToTrkTrkMuMu_trk1_dca_sig\"] = df['BToTrkTrkMuMu_trk1_dca'] / df['BToTrkTrkMuMu_trk1_dcaErr']\n",
+    "    df[\"BToTrkTrkMuMu_trk2_dca_sig\"] = df['BToTrkTrkMuMu_trk2_dca'] / df['BToTrkTrkMuMu_trk2_dcaErr']\n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "cb81dbce-b76b-4b56-a5e8-652304468895",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def apply_selection(df, mode=\"mc\"):\n",
+    "\n",
+    "    kstar_pdg = 0.892\n",
+    "    mask_kpi_window = abs(df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] - kstar_pdg) <= 0.150\n",
+    "    mask_pik_window = abs(df['BToTrkTrkMuMu_fit_ditrack_mass_piK'] - kstar_pdg) <= 0.150\n",
+    "    \n",
+    "    is_kpi_closer = abs(df['BToTrkTrkMuMu_fit_ditrack_mass_Kpi'] - kstar_pdg) < \\\n",
+    "                    abs(df['BToTrkTrkMuMu_fit_ditrack_mass_piK'] - kstar_pdg)\n",
+    "    \n",
+    "    mask = (\n",
+    "        (((df['MuMu_mass'] > 1.0) & (df['MuMu_mass'] < 2.7)) | \n",
+    "         ((df['MuMu_mass'] > 4.0) & (df['MuMu_mass'] < 6.0))) & \n",
+    "        \n",
+    "        (mask_kpi_window | mask_pik_window) &         \n",
+    "        (is_kpi_closer) &\n",
+    "        \n",
+    "        # Trigger e cortes cinemáticos dos múons\n",
+    "        (df['HLT_DoubleMu4_3_LowMass'] == 1) & \n",
+    "        (df['BPH_1Muon_pt'] > 4.0) & (df['BPH_2Muon_pt'] > 4.0) & \n",
+    "        (abs(df['BPH_1Muon_eta']) < 2.4) & (abs(df['BPH_2Muon_eta']) < 2.4)\n",
+    "    )\n",
+    "    if mode == \"mc\":\n",
+    "        mask = mask & (df['BToTrkTrkMuMu_fit_mass_Kpi'] > 5.2) & (df['BToTrkTrkMuMu_fit_mass_Kpi'] < 5.4)\n",
+    "        mask = mask & get_b0_truth_mask(df)\n",
+    "    else:\n",
+    "        mask = mask & (\n",
+    "            ((df['BToTrkTrkMuMu_fit_mass_Kpi'] > 5.0) & (df['BToTrkTrkMuMu_fit_mass_Kpi'] < 5.2)) | \n",
+    "            ((df['BToTrkTrkMuMu_fit_mass_Kpi'] > 5.4) & (df['BToTrkTrkMuMu_fit_mass_Kpi'] < 5.6))\n",
+    "        )\n",
+    "    \n",
+    "    cols_to_keep = [\n",
+    "        'BToTrkTrkMuMu_l_xy_sig', 'BToTrkTrkMuMu_dca_sig', \n",
+    "        'BToTrkTrkMuMu_trk1_dca_sig', 'BToTrkTrkMuMu_trk2_dca_sig', \n",
+    "        'BToTrkTrkMuMu_fit_ditrack_mass_Kpi', 'BToTrkTrkMuMu_fit_pt', \n",
+    "        'BToTrkTrkMuMu_fit_cos2D', 'BToTrkTrkMuMu_svprob', \"BToTrkTrkMuMu_fit_mass_Kpi\"\n",
+    "    ]\n",
+    "    return df[cols_to_keep][mask]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "15814657-ce48-4c0f-942d-60e56997a548",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_dataframe(file_dict, label=\"Dataset\", mode=\"mc\"):\n",
+    "    print(f\"\\nProcessando {label}...\")    \n",
+    "    df = uproot.dask(file_dict)\n",
+    "    df = add_derived_columns(df)\n",
+    "    df = apply_selection(df, mode=mode)\n",
+    "    \n",
+    "    with ProgressBar():\n",
+    "        awkward_array = df.compute()\n",
+    "        df_pandas = ak.to_dataframe(awkward_array).reset_index(drop=True)\n",
+    "    \n",
+    "    print(f\"{label} finalizado. Linhas: {len(df_pandas)}\")\n",
+    "    return df_pandas"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "9bdbf74f-d1d8-4825-9a8e-b332af96e620",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "Processando MC...\n",
+      "[########################################] | 100% Completed | 324.18 ms\n",
+      "[                                        ] | 0% Completed | 13.90 sms"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/awkward/_nplikes/array_module.py:285: RuntimeWarning: divide by zero encountered in divide\n",
+      "  return impl(*broadcasted_args, **(kwargs or {}))\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[########################################] | 100% Completed | 16.86 s\n",
+      "MC finalizado. Linhas: 79215\n",
+      "\n",
+      "Processando MC...\n",
+      "[########################################] | 100% Completed | 313.72 ms\n",
+      "[                                        ] | 0% Completed | 31.59 sms"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/awkward/_nplikes/array_module.py:285: RuntimeWarning: divide by zero encountered in divide\n",
+      "  return impl(*broadcasted_args, **(kwargs or {}))\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[########################################] | 100% Completed | 40.58 s\n",
+      "MC finalizado. Linhas: 282185\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/cvmfs/sft.cern.ch/lcg/views/LCG_109_cuda/x86_64-el9-gcc13-opt/lib/python3.13/site-packages/awkward/_nplikes/array_module.py:285: RuntimeWarning: divide by zero encountered in divide\n",
+      "  return impl(*broadcasted_args, **(kwargs or {}))\n"
+     ]
+    }
+   ],
+   "source": [
+    "df_mc    = build_dataframe(mc_files, \"MC\", mode=\"mc\")\n",
+    "df_mc_EE = build_dataframe(mc_files_EE, \"MC\", mode=\"mc\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "829a33c2-c1f9-4fc3-acab-48ba12ddf483",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "Processando Data...\n",
+      "[########################################] | 100% Completed | 209.18 ms\n",
+      "[#############                           ] | 33% Completed | 72.90 ss"
+     ]
+    }
+   ],
+   "source": [
+    "df_data    = build_dataframe(data_files, \"Data\", mode=\"data\")\n",
+    "df_data_EE = build_dataframe(data_files_EE, \"Data\", mode=\"data\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "6237e0cb-4946-4979-8cdd-157f472450ad",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_before_ee = joblib.load(\"modelos_treinados/final_bdt_model.joblib\")\n",
+    "model_pos_ee    = joblib.load(\"modelos_treinados/final_bdt_modelEE.joblib\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d0aa1fad-e7f1-4c23-8b16-6ccaae39573e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cols_to_drop = [\"BToTrkTrkMuMu_fit_mass_Kpi\"]\n",
+    "feat_data    = df_data.drop(columns=cols_to_drop)\n",
+    "feat_mc      = df_mc.drop(columns=cols_to_drop)\n",
+    "feat_data_ee = df_data_EE.drop(columns=cols_to_drop)\n",
+    "feat_mc_ee   = df_mc_EE.drop(columns=cols_to_drop)\n",
+    "\n",
+    "# --- 2. Aplicação do Modelo \"Before EE\" ---\n",
+    "# Em seu próprio dataset (Nativo)\n",
+    "df_mc[\"score_native\"]   = model_before_ee.predict_proba(feat_mc)[:,1]\n",
+    "df_data[\"score_native\"] = model_before_ee.predict_proba(feat_data)[:,1]\n",
+    "# No dataset oposto (Cross)\n",
+    "df_mc_EE[\"score_cross\"]   = model_before_ee.predict_proba(feat_mc_ee)[:,1]\n",
+    "df_data_EE[\"score_cross\"] = model_before_ee.predict_proba(feat_data_ee)[:,1]\n",
+    "\n",
+    "# --- 3. Aplicação do Modelo \"Post EE\" ---\n",
+    "# Em seu próprio dataset (Nativo)\n",
+    "df_mc_EE[\"score_native\"]   = model_pos_ee.predict_proba(feat_mc_ee)[:,1]\n",
+    "df_data_EE[\"score_native\"] = model_pos_ee.predict_proba(feat_data_ee)[:,1]\n",
+    "# No dataset oposto (Cross)\n",
+    "df_mc[\"score_cross\"]   = model_pos_ee.predict_proba(feat_mc)[:,1]\n",
+    "df_data[\"score_cross\"] = model_pos_ee.predict_proba(feat_data)[:,1]\n",
+    "\n",
+    "print(\"Processamento concluído: Colunas 'score_native' e 'score_cross' adicionadas.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "47b56103-cfb0-4600-b591-23344904cc8d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_cross_comparison(df_sig, df_bkg, title, filename):\n",
+    "    plt.figure(figsize=(9, 8))\n",
+    "    \n",
+    "    # Histogramas para o Modelo Nativo (Treinado nesta era)\n",
+    "    h_sig_nat, bins = np.histogram(df_sig['score_native'], bins=50, range=(0,1), density=True)\n",
+    "    h_bkg_nat, _    = np.histogram(df_bkg['score_native'], bins=bins, density=True)\n",
+    "    \n",
+    "    # Histogramas para o Modelo Cross (Treinado na outra era)\n",
+    "    h_sig_cro, _    = np.histogram(df_sig['score_cross'], bins=bins, density=True)\n",
+    "    h_bkg_cro, _    = np.histogram(df_bkg['score_cross'], bins=bins, density=True)\n",
+    "\n",
+    "    # Plot Native Model\n",
+    "    hep.histplot(h_sig_nat, bins, label='MC (Native Model)', color='blue', linewidth=2)\n",
+    "    hep.histplot(h_bkg_nat, bins, label='Data (Native Model)', color='black', linewidth=2, linestyle='--')\n",
+    "    \n",
+    "    # Plot Cross Model\n",
+    "    hep.histplot(h_sig_cro, bins, label='MC (Cross Model)', color='red', linewidth=1, alpha=0.7)\n",
+    "    hep.histplot(h_bkg_cro, bins, label='Data (Cross Model)', color='gray', linewidth=1, linestyle=':', alpha=0.7)\n",
+    "\n",
+    "    plt.yscale('log')\n",
+    "    plt.xlabel('BDT Score', fontsize=16)\n",
+    "    plt.ylabel('Normalized Events', fontsize=16)\n",
+    "    plt.legend(loc='upper center', ncol=2, fontsize=10)\n",
+    "    \n",
+    "    hep.cms.label(exp=\"CMS\", data=False, year=\"2022\", com=13.6, label=f\"Internal\\n{title}\", fontsize=14)\n",
+    "    \n",
+    "    plt.tight_layout()\n",
+    "    plt.savefig(filename)\n",
+    "    plt.show()\n",
+    "\n",
+    "# --- Execução dos Plots ---\n",
+    "\n",
+    "# Comparação nos dados PÓS-EE (Era com o problema do detector)\n",
+    "plot_cross_comparison(df_mc, df_data, \n",
+    "                     \"Evaluation on: Post-EE Era\", \n",
+    "                     \"Comparison_on_PostEE_Dataset.png\")\n",
+    "\n",
+    "# Comparação nos dados ANTES-EE (Era normal)\n",
+    "plot_cross_comparison(df_mc_EE, df_data_EE, \n",
+    "                     \"Evaluation on: Before-EE Era\", \n",
+    "                     \"Comparison_on_BeforeEE_Dataset.png\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4fc99bd7-1baf-4099-87af-426d269cde37",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
