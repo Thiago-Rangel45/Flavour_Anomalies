@@ -1,0 +1,118 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "TFile.h"
+#include "TTree.h"
+#include "TRandom3.h"
+#include "TMath.h"
+#include "TString.h"
+#include "RooRealVar.h"
+#include "RooDataSet.h"
+#include "RooWorkspace.h"
+#include "RooArgSet.h"
+#include "RooAbsData.h"
+
+using namespace RooFit;
+
+void process_angles_simfit() {
+    // Garantir compatibilidade de armazenamento de dados entre versões do ROOT
+    RooAbsData::setDefaultStorageType(RooAbsData::Tree);
+
+    // 1. Abrir o arquivo de entrada (RECO flat ntuple gerado pelo python)
+    TFile* f_in = TFile::Open("Filtered_RECO_Kinematics_NoFSR.root", "READ");
+    if (!f_in || f_in->IsZombie()) {
+        std::cerr << "Erro ao abrir Filtered_RECO_Kinematics_NoFSR.root" << std::endl;
+        return;
+    }
+    TTree* tree = (TTree*)f_in->Get("Events");
+
+    // 2. Variáveis para leitura da TTree (uproot salva como double / float64 por padrao)
+    float mass_Kpi, cos_theta_k, cos_theta_l, phi_angle, mll_fullfit;
+
+    tree->SetBranchAddress("BToTrkTrkMuMu_fit_mass_Kpi", &mass_Kpi);
+    tree->SetBranchAddress("BToTrkTrkMuMu_cos_theta_k", &cos_theta_k);
+    tree->SetBranchAddress("BToTrkTrkMuMu_cos_theta_l", &cos_theta_l);
+    tree->SetBranchAddress("BToTrkTrkMuMu_phi_angle", &phi_angle);
+    tree->SetBranchAddress("BToTrkTrkMuMu_mll_fullfit", &mll_fullfit);
+
+    // 3. Preparar Variáveis RooFit
+    RooRealVar ctK("ctK", "ctK", -1, 1);
+    RooRealVar ctL("ctL", "ctL", -1, 1);
+    RooRealVar phi("phi", "phi", -TMath::Pi(), TMath::Pi());
+    RooRealVar rand("rand", "rand", 0, 1);
+    RooRealVar mass("mass", "mass", 5.0, 5.6);
+    RooArgSet argset(ctK, ctL, phi, rand, mass);
+
+    const int nBins = 9;
+    std::vector<RooDataSet*> base_datasets;
+    for (int i = 0; i < nBins; ++i) {
+        base_datasets.push_back(new RooDataSet(Form("tmp_b%d", i), "tmp", argset));
+    }
+
+    TRandom3 rand_gen(12345);
+    Long64_t nEntries = tree->GetEntries();
+    std::cout << "Processando " << nEntries << " candidatos de B0 RECO..." << std::endl;
+
+    // 4. Loop de Processamento
+    for (Long64_t i = 0; i < nEntries; ++i) {
+        tree->GetEntry(i);
+
+        // q2 é o quadrado da massa invariante dos dimuons
+        double q2 = mll_fullfit * mll_fullfit;
+        int b = -1;
+        if (q2 >= 1.1 && q2 < 2.0) b = 0; 
+        else if (q2 >= 2.0 && q2 < 4.3) b = 1;
+        else if (q2 >= 4.3 && q2 < 6.0) b = 2; 
+        else if (q2 >= 6.0 && q2 < 8.68) b = 3;
+        else if (q2 >= 8.68 && q2 < 10.09) b = 4;
+        else if (q2 >= 10.09 && q2 < 12.86) b = 5;
+        else if (q2 >= 12.86 && q2 < 14.18) b = 6;
+        else if (q2 >= 14.18 && q2 < 16.0) b = 7;
+        else if (q2 >= 16.0 && q2 < 19.0) b = 8;
+        
+        if (b == -1) continue;
+
+        // Filtro contra NANs antes de adicionar ao Dataset
+        if (std::isnan(cos_theta_k) || std::isnan(cos_theta_l) || std::isnan(phi_angle) || std::isnan(mass_Kpi)) continue;
+        if (mass_Kpi < 5.0 || mass_Kpi > 5.6) continue;
+        
+        ctK.setVal(cos_theta_k); 
+        ctL.setVal(cos_theta_l); 
+        phi.setVal(phi_angle); 
+        mass.setVal(mass_Kpi); 
+        rand.setVal(rand_gen.Uniform(1));
+        
+        base_datasets[b]->add(argset);
+    }
+    f_in->Close();
+
+    // 5. Exportação
+    for (int i = 0; i < nBins; ++i) {
+        if (base_datasets[i]->numEntries() == 0) continue;
+        
+        // Atualizado nome do arquivo para evidenciar que é RECO
+        TString fileName = Form("./effDataset_RECO_b%d.root", i);
+        TFile* f_out = TFile::Open(fileName, "RECREATE");
+
+        for (int p = 0; p < 2; ++p) {
+            TString wsName = Form("ws_b%dp%d", i, p);
+            RooWorkspace ws(wsName);
+            
+            // Renomeado para evitar confusão com GenLevel nos ajustes
+            TString nameEv = Form("data_RECO_ev_b%d", i);
+            TString nameOd = Form("data_RECO_od_b%d", i);
+            
+            ws.import(*base_datasets[i], Rename(nameEv));
+            ws.import(*base_datasets[i], Rename(nameOd));
+            
+            ws.Write();
+        }
+        f_out->Close();
+        std::cout << "Bin " << i << " salva com sucesso em " << fileName << " (" << base_datasets[i]->numEntries() << " candidatos)." << std::endl;
+    }
+}
+
+int main() {
+    process_angles_simfit();
+    return 0;
+}

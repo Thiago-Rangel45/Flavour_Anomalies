@@ -1,0 +1,66 @@
+# ════════════════════════════════════════════════════════════════
+# 2.  LEITURA DE DADOS VIA PyROOT (Fallback robusto para RooWorkspace)
+# ════════════════════════════════════════════════════════════════
+def load_dataset(filename: str, q2Bin: int, parity: int,
+                 nSample: int, firstSample: int,
+                 lastSample: int) -> Dict[int, np.ndarray]:
+    """
+    Lê o workspace ROOT e extrai datasets para cada subsample.
+    Utiliza PyROOT em vez de uproot para evitar erros de desserialização 
+    com a classe complexa RooWorkspace do RooFit.
+    """
+    import ROOT
+    import numpy as np
+
+    if not os.path.isfile(filename):
+        raise FileNotFoundError(f"Dataset não encontrado: {filename}")
+
+    ws_key = f"ws_b{q2Bin}p{parity}"
+    ds_name = f"data_RECO_ev_b{q2Bin}" if parity == 0 else f"data_RECO_od_b{q2Bin}"
+
+    # Evita que o ROOT assuma o controle dos argumentos de linha de comando
+    ROOT.PyConfig.IgnoreCommandLineOptions = True
+
+    # 1. Abre via ROOT nativo
+    f_in = ROOT.TFile.Open(filename, "READ")
+    if not f_in or f_in.IsZombie():
+        raise RuntimeError(f"Erro ao abrir arquivo ROOT: {filename}")
+
+    # 2. Puxa o Workspace
+    ws = f_in.Get(ws_key)
+    if not ws:
+        raise RuntimeError(f"Workspace '{ws_key}' não encontrado em {filename}")
+
+    # 3. Puxa o DataSet
+    ds = ws.data(ds_name)
+    if not ds:
+        raise RuntimeError(f"Dataset '{ds_name}' não encontrado no workspace '{ws_key}'")
+
+    # 4. Extrai a TTree interna e usa o RDataFrame para converter em Numpy instantaneamente
+    tree = ds.GetClonedTree()
+    df = ROOT.RDataFrame(tree)
+    data_dict = df.AsNumpy(["ctK", "ctL", "phi", "rand"])
+    
+    f_in.Close()
+
+    ctK  = data_dict["ctK"]
+    ctL  = data_dict["ctL"]
+    phi  = data_dict["phi"]
+    rand = data_dict["rand"]
+
+    data_all = np.column_stack([ctK, ctL, phi])
+    result = {}
+
+    if nSample == 0:
+        # Usa metade da estatística MC (complementar ao fit de eficiência)
+        mask = rand < 0.5
+        result[0] = data_all[mask]
+    else:
+        # Divide em subsamples de tamanho data-like
+        for is_ in range(firstSample, lastSample + 1):
+            lo = is_ / nSample
+            hi = (is_ + 1) / nSample
+            mask = (rand >= lo) & (rand < hi)
+            result[is_] = data_all[mask]
+
+    return result

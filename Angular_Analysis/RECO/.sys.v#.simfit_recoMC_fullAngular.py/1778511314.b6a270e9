@@ -1,0 +1,662 @@
+"""
+simfit_recoMC_fullAngular.py
+============================
+Tradução completa do simfit_recoMC_fullAngular.cc (ROOT/RooFit) para Python
+usando uproot (leitura de arquivos ROOT) e zfit (fit de máxima verossimilhança).
+
+Análise: B0 → K* μ μ  — fit simultâneo sobre variáveis angulares (ctK, ctL, phi)
+ponderado pela eficiência KDE, separado por sample (year × parity).
+
+Dependências:
+    pip install uproot awkward numpy scipy matplotlib zfit iminuit
+
+Uso:
+    python simfit_recoMC_fullAngular.py \
+        --q2bin 3 --parity 0 \
+        --nSample 0 --save --plot
+
+Autor: tradução automática de CMSKStarMuMu/UML-fit adaptada para a Ntuple RECO
+"""
+
+import argparse
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import uproot
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import zfit
+import zfit.z.math as zmath
+import tensorflow as tf
+from scipy.interpolate import RegularGridInterpolator
+
+# ────────────────────────────────────────────────────────────────
+# Constantes globais
+# ────────────────────────────────────────────────────────────────
+N_BINS = 9          # número de bins em q²
+SQRT2  = float(np.sqrt(2))
+
+
+# ════════════════════════════════════════════════════════════════
+# 1.  ESPAÇO DE FASES (zfit.Space)
+# ════════════════════════════════════════════════════════════════
+def make_obs() -> Tuple[zfit.Space, zfit.Space, zfit.Space, zfit.Space]:
+    """Cria os observáveis ctK, ctL, phi."""
+    obs_ctK = zfit.Space("ctK", limits=(-1.0, 1.0))
+    obs_ctL = zfit.Space("ctL", limits=(-1.0, 1.0))
+    obs_phi = zfit.Space("phi", limits=(-np.pi, np.pi))
+    obs_3d  = obs_ctK * obs_ctL * obs_phi
+    return obs_ctK, obs_ctL, obs_phi, obs_3d
+
+
+# ════════════════════════════════════════════════════════════════
+# 2.  LEITURA DE DADOS VIA uproot
+# ════════════════════════════════════════════════════════════════
+def load_dataset(filename: str, q2Bin: int, parity: int,
+                 nSample: int, firstSample: int,
+                 lastSample: int) -> Dict[int, np.ndarray]:
+    """
+    Lê o workspace ROOT e extrai datasets para cada subsample.
+    Retorna dict {is: array shape (N,3)} com colunas [ctK, ctL, phi].
+    """
+    if not os.path.isfile(filename):
+        raise FileNotFoundError(f"Dataset não encontrado: {filename}")
+
+    result = {}
+
+    with uproot.open(filename) as f:
+        # ATUALIZADO: Usando o nome correto do workspace gerado pelo script C++ (ex: ws_b3p0)
+        ws_key = f"ws_b{q2Bin}p{parity}"
+        
+        if ws_key not in f:
+            # fallback: tenta ler TTree diretamente
+            tree_keys = [k for k in f.keys() if "Events" in k or "tree" in k.lower() or "data_RECO" in k]
+            if not tree_keys:
+                raise RuntimeError(f"Workspace '{ws_key}' não encontrado em {filename}")
+            tree = f[tree_keys[0]]
+        else:
+            # RooWorkspace exportado: dentro há um RooDataSet que vira TTree no uproot
+            ws_obj = f[ws_key]
+            inner = {k: ws_obj[k] for k in ws_obj.keys() if "RooDataSet" not in str(type(ws_obj[k]))}
+            tree = list(inner.values())[0] if inner else ws_obj
+
+        # Leitura das branches angulares
+        branches = tree.arrays(["ctK", "ctL", "phi", "rand"], library="np")
+
+    ctK  = branches["ctK"]
+    ctL  = branches["ctL"]
+    phi  = branches["phi"]
+    rand = branches["rand"] if "rand" in branches else np.random.uniform(0, 1, len(ctK))
+
+    data_all = np.column_stack([ctK, ctL, phi])
+
+    if nSample == 0:
+        # Usa metade da estatística MC (complementar ao fit de eficiência)
+        mask = rand < 0.5
+        result[0] = data_all[mask]
+    else:
+        # Divide em subsamples de tamanho data-like
+        for is_ in range(firstSample, lastSample + 1):
+            lo = is_ / nSample
+            hi = (is_ + 1) / nSample
+            mask = (rand >= lo) & (rand < hi)
+            result[is_] = data_all[mask]
+
+    return result
+
+
+# ════════════════════════════════════════════════════════════════
+# 3.  LEITURA DA EFICIÊNCIA KDE (histograma 3D) via uproot
+# ════════════════════════════════════════════════════════════════
+class KDEEfficiency:
+    """
+    Encapsula o histograma 3D TH3D da eficiência KDE lido via uproot.
+    Fornece interpolação trilinear para avaliar eff(ctK, ctL, phi).
+    """
+
+    def __init__(self, filename: str, hist_name: str,
+                 int_hist_name: Optional[str] = None):
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(f"Arquivo de eficiência não encontrado: {filename}")
+
+        with uproot.open(filename) as f:
+            if hist_name not in f:
+                raise KeyError(f"Histograma '{hist_name}' não encontrado em {filename}")
+            h = f[hist_name]
+            vals, edges = h.to_numpy()  # (Nx, Ny, Nz), (ex, ey, ez)
+
+            self.values = vals.astype(np.float64)
+            self.edges  = edges  # lista de 3 arrays de bordas
+
+            # Centros dos bins
+            cx = 0.5 * (edges[0][:-1] + edges[0][1:])
+            cy = 0.5 * (edges[1][:-1] + edges[1][1:])
+            cz = 0.5 * (edges[2][:-1] + edges[2][1:])
+            self.centers = (cx, cy, cz)
+
+            # Interpolador scipy (trilinear = method='linear')
+            self._interp = RegularGridInterpolator(
+                (cx, cy, cz), self.values,
+                method="linear", bounds_error=False, fill_value=0.0
+            )
+
+            # Integrais pré-calculadas (vetor 1D de valores)
+            self.int_vec: List[float] = []
+            if int_hist_name and int_hist_name in f:
+                h_int = f[int_hist_name]
+                self.int_vec = list(h_int.to_numpy()[0].flatten())
+
+    def __call__(self, ctK: np.ndarray, ctL: np.ndarray,
+                 phi: np.ndarray) -> np.ndarray:
+        """Avalia a eficiência KDE em pontos (ctK, ctL, phi)."""
+        pts = np.column_stack([ctK, ctL, phi])
+        return self._interp(pts)
+
+    def integral(self, param_index: int) -> float:
+        """Retorna a integral pré-calculada para o parâmetro de índice i."""
+        if self.int_vec and param_index < len(self.int_vec):
+            return self.int_vec[param_index]
+        return 1.0
+
+
+# ════════════════════════════════════════════════════════════════
+# 4.  PDF ANGULAR (B0→K*μμ com eficiência)
+# ════════════════════════════════════════════════════════════════
+def _d2_decay_rate(ctK, ctL, phi,
+                   Fl, P1, P2, P3, P4p, P5p, P6p, P8p) -> tf.Tensor:
+    """
+    Calcula a taxa de decaimento angular não normalizada
+    """
+    stK2 = 1.0 - ctK**2
+    stL2 = 1.0 - ctL**2
+    stK  = tf.sqrt(tf.maximum(stK2, 1e-10))
+    stL  = tf.sqrt(tf.maximum(stL2, 1e-10))
+    c2phi = tf.cos(2.0 * phi)
+    sphi  = tf.sin(phi)
+    cphi  = tf.cos(phi)
+    s2phi = tf.sin(2.0 * phi)
+
+    norm = 9.0 / (32.0 * np.pi)
+
+    T1  = (3.0/4.0) * (1.0 - Fl) * stK2 * stL2
+    T2  = Fl * ctK**2 * stL2
+    T3  = (1.0/4.0) * (1.0 - Fl) * stK2 * (1.0 + ctL**2)
+    T4  = P1 * (1.0/2.0) * (1.0 - Fl) * stK2 * stL2 * c2phi
+    T5  = P2 * (1.0 - Fl) * stK2 * ctL
+    T6  = P3 * (1.0/2.0) * (1.0 - Fl) * stK2 * stL2 * s2phi
+    T7  = P4p * (1.0/2.0) * tf.sqrt(Fl * (1.0 - Fl)) * stK * stL * (2.0 * ctK) * cphi
+    T8  = P5p * tf.sqrt(Fl * (1.0 - Fl)) * stK * ctL * stL * cphi
+    T9  = P6p * tf.sqrt(Fl * (1.0 - Fl)) * stK * ctL * stL * sphi
+    T10 = P8p * (1.0/2.0) * tf.sqrt(Fl * (1.0 - Fl)) * stK * stL2 * sphi
+
+    rate = norm * (T1 + T2 + T3 + T4 + T5 + T6 + T7 + T8 + T9 + T10)
+    return tf.maximum(rate, 0.0)
+
+
+class AngularSignalPDF(zfit.pdf.BasePDF):
+    def __init__(self, obs: zfit.Space,
+                 Fl, P1, P2, P3, P4p, P5p, P6p, P8p, mFrac,
+                 eff_CT, eff_WT,
+                 name: str = "AngularSignalPDF"):
+        params = dict(Fl=Fl, P1=P1, P2=P2, P3=P3,
+                      P4p=P4p, P5p=P5p, P6p=P6p, P8p=P8p, mFrac=mFrac)
+        super().__init__(obs=obs, params=params, name=name)
+        self.eff_CT = eff_CT
+        self.eff_WT = eff_WT
+
+    def _unnormalized_pdf(self, x):
+        data = zfit.z.unstack_x(x)
+        ctK_t, ctL_t, phi_t = data[0], data[1], data[2]
+
+        Fl    = self.params["Fl"]
+        P1    = self.params["P1"]
+        P2    = self.params["P2"]
+        P3    = self.params["P3"]
+        P4p   = self.params["P4p"]
+        P5p   = self.params["P5p"]
+        P6p   = self.params["P6p"]
+        P8p   = self.params["P8p"]
+        mFrac = self.params["mFrac"]
+
+        rate = _d2_decay_rate(ctK_t, ctL_t, phi_t,
+                               Fl, P1, P2, P3, P4p, P5p, P6p, P8p)
+
+        ctK_np = ctK_t.numpy()
+        ctL_np = ctL_t.numpy()
+        phi_np = phi_t.numpy()
+
+        eff_ct_vals = tf.constant(self.eff_CT(ctK_np, ctL_np, phi_np),
+                                  dtype=zfit.settings.ztypes.float)
+        eff_wt_vals = tf.constant(self.eff_WT(ctK_np, ctL_np, phi_np),
+                                  dtype=zfit.settings.ztypes.float)
+
+        pdf_val = eff_ct_vals * rate + mFrac * eff_wt_vals * rate
+        return tf.maximum(pdf_val, 0.0)
+
+    def _normalization(self, limits, options=None):
+        if hasattr(self.eff_CT, 'int_vec') and self.eff_CT.int_vec:
+            return self._analytic_norm()
+        else:
+            return self._mc_norm()
+
+    def _analytic_norm(self) -> tf.Tensor:
+        Fl    = self.params["Fl"]
+        P1    = self.params["P1"]
+        P2    = self.params["P2"]
+        P3    = self.params["P3"]
+        P4p   = self.params["P4p"]
+        P5p   = self.params["P5p"]
+        P6p   = self.params["P6p"]
+        P8p   = self.params["P8p"]
+        mFrac = self.params["mFrac"]
+
+        iv_ct = self.eff_CT.int_vec
+        iv_wt = self.eff_WT.int_vec
+
+        def norm_from_vec(iv):
+            n = len(iv)
+            if n < 10:
+                return self._mc_norm()
+            sqFl1mFl = tf.sqrt(Fl * (1.0 - Fl))
+            total = (
+                (3.0/4.0)*(1.0-Fl) * iv[0]
+              + Fl                  * iv[1]
+              + (1.0/4.0)*(1.0-Fl) * iv[2]
+              + (1.0/2.0)*(1.0-Fl) * P1 * iv[3]
+              + (1.0-Fl)           * P2 * iv[4]
+              + (1.0/2.0)*(1.0-Fl) * P3 * iv[5]
+              + sqFl1mFl           * P4p * iv[6]
+              + sqFl1mFl           * P5p * iv[7]
+              + sqFl1mFl           * P6p * iv[8]
+              + sqFl1mFl           * P8p * iv[9]
+            )
+            return (9.0 / (32.0 * np.pi)) * total
+
+        norm_ct = norm_from_vec(iv_ct)
+        norm_wt = norm_from_vec(iv_wt)
+        return norm_ct + mFrac * norm_wt
+
+    def _mc_norm(self, n_mc: int = 50_000) -> tf.Tensor:
+        rng = np.random.default_rng(42)
+        ctK_mc = rng.uniform(-1, 1, n_mc)
+        ctL_mc = rng.uniform(-1, 1, n_mc)
+        phi_mc = rng.uniform(-np.pi, np.pi, n_mc)
+
+        rate_mc = _d2_decay_rate(
+            tf.constant(ctK_mc, dtype=zfit.settings.ztypes.float),
+            tf.constant(ctL_mc, dtype=zfit.settings.ztypes.float),
+            tf.constant(phi_mc, dtype=zfit.settings.ztypes.float),
+            self.params["Fl"], self.params["P1"], self.params["P2"],
+            self.params["P3"], self.params["P4p"], self.params["P5p"],
+            self.params["P6p"], self.params["P8p"]
+        )
+
+        eff_ct_mc = tf.constant(self.eff_CT(ctK_mc, ctL_mc, phi_mc), dtype=zfit.settings.ztypes.float)
+        eff_wt_mc = tf.constant(self.eff_WT(ctK_mc, ctL_mc, phi_mc), dtype=zfit.settings.ztypes.float)
+
+        mFrac = self.params["mFrac"]
+        integrand = (eff_ct_mc + mFrac * eff_wt_mc) * rate_mc
+
+        volume = 2.0 * 2.0 * 2.0 * np.pi
+        return tf.reduce_mean(integrand) * volume
+
+
+# ════════════════════════════════════════════════════════════════
+# 5.  VERIFICAÇÃO DE FRONTEIRA FÍSICA
+# ════════════════════════════════════════════════════════════════
+def check_physical_boundary(Fl, P1, P2, P3, P4p, P5p, P6p, P8p) -> bool:
+    n_test = 10_000
+    rng = np.random.default_rng(0)
+    ctK = rng.uniform(-1, 1, n_test)
+    ctL = rng.uniform(-1, 1, n_test)
+    phi = rng.uniform(-np.pi, np.pi, n_test)
+
+    ctK_t = tf.constant(ctK, dtype=tf.float64)
+    ctL_t = tf.constant(ctL, dtype=tf.float64)
+    phi_t = tf.constant(phi, dtype=tf.float64)
+
+    rate = _d2_decay_rate(ctK_t, ctL_t, phi_t, Fl, P1, P2, P3, P4p, P5p, P6p, P8p)
+    return bool(tf.reduce_min(rate).numpy() >= 0.0)
+
+def boundary_distance(params: dict) -> float:
+    n_test = 5_000
+    rng = np.random.default_rng(1)
+    ctK = rng.uniform(-1, 1, n_test)
+    ctL = rng.uniform(-1, 1, n_test)
+    phi = rng.uniform(-np.pi, np.pi, n_test)
+
+    ctK_t = tf.constant(ctK, dtype=tf.float64)
+    ctL_t = tf.constant(ctL, dtype=tf.float64)
+    phi_t = tf.constant(phi, dtype=tf.float64)
+
+    rate = _d2_decay_rate(ctK_t, ctL_t, phi_t,
+                          params["Fl"], params["P1"], params["P2"], params["P3"],
+                          params["P4p"], params["P5p"], params["P6p"], params["P8p"])
+    return float(tf.reduce_min(rate).numpy())
+
+
+# ════════════════════════════════════════════════════════════════
+# 6.  PARÂMETROS DO FIT
+# ════════════════════════════════════════════════════════════════
+def make_parameters():
+    Fl   = zfit.Parameter("Fl",   0.5,   0.0,    1.0)
+    P1   = zfit.Parameter("P1",   0.0,  -1.0,    1.0)
+    P2   = zfit.Parameter("P2",   0.0,  -0.5,    0.5)
+    P3   = zfit.Parameter("P3",   0.0,  -0.5,    0.5)
+    P4p  = zfit.Parameter("P4p",  0.0,  -SQRT2,  SQRT2)
+    P5p  = zfit.Parameter("P5p",  0.0,  -SQRT2,  SQRT2)
+    P6p  = zfit.Parameter("P6p",  0.0,  -SQRT2,  SQRT2)
+    P8p  = zfit.Parameter("P8p",  0.0,  -SQRT2,  SQRT2)
+    mFrac = zfit.Parameter("mFrac", 1.0, 0.0, 2.0, floating=False)
+    return Fl, P1, P2, P3, P4p, P5p, P6p, P8p, mFrac
+
+def reset_parameters(Fl, P1, P2, P3, P4p, P5p, P6p, P8p, mFrac):
+    for p, v in [(Fl, 0.5), (P1, 0.), (P2, 0.), (P3, 0.),
+                 (P4p, 0.), (P5p, 0.), (P6p, 0.), (P8p, 0.), (mFrac, 1.)]:
+        p.set_value(v)
+
+
+# ════════════════════════════════════════════════════════════════
+# 8.  GRÁFICOS DE PROJEÇÃO
+# ════════════════════════════════════════════════════════════════
+def plot_projections(data_arrays: Dict[str, np.ndarray],
+                     pdfs: Dict[str, AngularSignalPDF],
+                     params: dict,
+                     output_path: str,
+                     q2Bin: int, parity: int):
+    var_names  = ["ctK", "ctL", "phi"]
+    var_labels = [r"$\cos\theta_K$", r"$\cos\theta_l$", r"$\phi$ [rad]"]
+    var_ranges = [(-1, 1), (-1, 1), (-np.pi, np.pi)]
+    n_bins_plot = 30
+
+    for key, data_np in data_arrays.items():
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle(f"B0→K*μμ  |  q² bin {q2Bin}  |  {'even' if parity==0 else 'odd'}  |  {key}",
+                     fontsize=12, y=1.02)
+
+        for i, (ax, vname, vlabel, vrange) in enumerate(
+                zip(axes, var_names, var_labels, var_ranges)):
+
+            col = data_np[:, i]
+            bin_edges = np.linspace(vrange[0], vrange[1], n_bins_plot + 1)
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            bin_width = bin_edges[1] - bin_edges[0]
+
+            counts, _ = np.histogram(col, bins=bin_edges)
+            errors = np.sqrt(counts)
+
+            ax.bar(bin_centers, counts, width=bin_width,
+                   color="#3182bd", alpha=0.6, label="Dados MC")
+            ax.errorbar(bin_centers, counts, yerr=errors,
+                        fmt="none", color="k", linewidth=1)
+
+            _n_pdf = 2_000
+            rng = np.random.default_rng(42)
+            if vname == "ctK":
+                x_pdf   = np.linspace(*vrange, 200)
+                ctL_rnd = rng.uniform(-1, 1, _n_pdf)
+                phi_rnd = rng.uniform(-np.pi, np.pi, _n_pdf)
+                y_pdf = np.array([
+                    np.mean(_pdf_point(xv, ctL_rnd, phi_rnd, params)) for xv in x_pdf
+                ])
+            elif vname == "ctL":
+                x_pdf   = np.linspace(*vrange, 200)
+                ctK_rnd = rng.uniform(-1, 1, _n_pdf)
+                phi_rnd = rng.uniform(-np.pi, np.pi, _n_pdf)
+                y_pdf = np.array([
+                    np.mean(_pdf_point(ctK_rnd, xv, phi_rnd, params)) for xv in x_pdf
+                ])
+            else:
+                x_pdf   = np.linspace(*vrange, 200)
+                ctK_rnd = rng.uniform(-1, 1, _n_pdf)
+                ctL_rnd = rng.uniform(-1, 1, _n_pdf)
+                y_pdf = np.array([
+                    np.mean(_pdf_point(ctK_rnd, ctL_rnd, xv, params)) for xv in x_pdf
+                ])
+
+            y_pdf_norm = y_pdf / (y_pdf.sum() * (x_pdf[1] - x_pdf[0])) * counts.sum() * bin_width
+            ax.plot(x_pdf, y_pdf_norm, color="#e6550d", linewidth=2, label="Fit")
+
+            ax.set_xlabel(vlabel, fontsize=11)
+            ax.set_ylabel("Eventos / bin", fontsize=11)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path.replace(".pdf", f"_{key}.pdf"),
+                    bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        print(f"  Plot salvo: {output_path.replace('.pdf', f'_{key}.pdf')}")
+
+
+def _pdf_point(ctK_v, ctL_v, phi_v, params: dict) -> np.ndarray:
+    ctK_t = tf.constant(np.atleast_1d(ctK_v).astype(np.float64))
+    ctL_t = tf.constant(np.atleast_1d(ctL_v).astype(np.float64))
+    phi_t = tf.constant(np.atleast_1d(phi_v).astype(np.float64))
+    rate = _d2_decay_rate(ctK_t, ctL_t, phi_t,
+                          params["Fl"], params["P1"], params["P2"],
+                          params["P3"], params["P4p"], params["P5p"],
+                          params["P6p"], params["P8p"])
+    return rate.numpy()
+
+
+# ════════════════════════════════════════════════════════════════
+# 9.  SALVAR RESULTADOS
+# ════════════════════════════════════════════════════════════════
+def save_results(result_dict: dict, output_dir: str, tag: str):
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    npz_path = os.path.join(output_dir, f"fitResult_{tag}.npz")
+    np.savez(npz_path, **{k: np.array(v) for k, v in result_dict.items()})
+    print(f"\nResultados salvos em: {npz_path}")
+
+    txt_path = os.path.join(output_dir, f"fitResult_{tag}.txt")
+    with open(txt_path, "w") as f:
+        f.write(f"Fit Result — {tag}\n")
+        f.write("=" * 60 + "\n")
+        for k, v in result_dict.items():
+            f.write(f"  {k:30s}: {v}\n")
+    print(f"Tabela de resultados: {txt_path}")
+
+
+# ════════════════════════════════════════════════════════════════
+# 10.  FUNÇÃO PRINCIPAL DO BIN
+# ════════════════════════════════════════════════════════════════
+def simfit_recoMC_fullAngularBin(
+    q2Bin: int,
+    parity: int,
+    multiSample: bool = False,
+    nSample: int = 0,
+    plot: bool = True,
+    save: bool = True,
+    output_dir: str = "simFitResults"
+):
+    short_string = f"b{q2Bin}p{parity}"
+    stat_str = f"_dataStat" if nSample > 0 else "_MCStat"
+
+    first_sample = 0 if (multiSample or nSample == 0) else nSample - 1
+    last_sample  = nSample - 1 if nSample > 0 else 0
+
+    print(f"\n{'='*60}")
+    print(f"Configuração: {short_string} ")
+    print(f"{'='*60}")
+
+    obs_ctK, obs_ctL, obs_phi, obs_3d = make_obs()
+    Fl, P1, P2, P3, P4p, P5p, P6p, P8p, mFrac = make_parameters()
+    param_names = ["Fl", "P1", "P2", "P3", "P4p", "P5p", "P6p", "P8p"]
+    param_objs  = [Fl, P1, P2, P3, P4p, P5p, P6p, P8p]
+
+    all_pdfs_by_sample:     Dict[int, Dict[str, AngularSignalPDF]] = {}
+    all_datasets_by_sample: Dict[int, Dict[str, np.ndarray]]       = {}
+
+    # ATUALIZADO: Nome do arquivo gerado pelo C++
+    fname_data = f"effDataset_RECO_b{q2Bin}.root"
+
+    # Como ainda não temos o script gerando os shapes KDE, simulamos flat eff
+    print(f"\n[Eficiência] Usando eficiência flat uniforme (ainda não parametrizado)")
+    eff_CT = _make_flat_efficiency()
+    eff_WT = _make_flat_efficiency()
+
+    print(f"Carregando dados RECO MC de: {fname_data}")
+    if os.path.isfile(fname_data):
+        data_per_sample = load_dataset(
+            fname_data, q2Bin, parity,
+            nSample, first_sample, last_sample
+        )
+    else:
+        raise FileNotFoundError(f"Arquivo não existe: {fname_data}. Rode o script C++ primeiro!")
+
+    for is_ in range(first_sample, last_sample + 1):
+        key = f"data_RECO_subs{is_}"
+
+        pdf = AngularSignalPDF(
+            obs=obs_3d,
+            Fl=Fl, P1=P1, P2=P2, P3=P3,
+            P4p=P4p, P5p=P5p, P6p=P6p, P8p=P8p,
+            mFrac=mFrac,
+            eff_CT=eff_CT, eff_WT=eff_WT,
+            name=f"PDF_sig_ang_{short_string}_s{is_}"
+        )
+
+        data_np = data_per_sample.get(is_, data_per_sample[first_sample])
+
+        if is_ not in all_pdfs_by_sample:
+            all_pdfs_by_sample[is_]     = {}
+            all_datasets_by_sample[is_] = {}
+
+        all_pdfs_by_sample[is_][key]     = pdf
+        all_datasets_by_sample[is_][key] = data_np
+
+    results_list  = []
+
+    for is_ in range(first_sample, last_sample + 1):
+        print(f"\n{'─'*50}")
+        n_entries = sum(len(v) for v in all_datasets_by_sample[is_].values())
+        print(f"Ajustando dados RECO com {n_entries} entradas")
+
+        reset_parameters(Fl, P1, P2, P3, P4p, P5p, P6p, P8p, mFrac)
+
+        zfit_datasets = {}
+        for key, arr in all_datasets_by_sample[is_].items():
+            zfit_datasets[key] = zfit.Data.from_numpy(obs=obs_3d, array=arr)
+
+        pdfs_s = all_pdfs_by_sample[is_]
+        loss_list = []
+        for key in pdfs_s:
+            nll = zfit.loss.UnbinnedNLL(model=pdfs_s[key], data=zfit_datasets[key])
+            loss_list.append(nll)
+
+        total_loss = loss_list[0]
+        for l in loss_list[1:]:
+            total_loss = total_loss + l
+
+        minimizer = zfit.minimize.Minuit(verbosity=1)
+        t0 = time.perf_counter()
+        fit_result = minimizer.minimize(total_loss)
+        fit_time = time.perf_counter() - t0
+        print(f"Tempo de fit: {fit_time:.1f} s")
+
+        conv_check  = fit_result.converged
+        param_vals  = {n: float(p) for n, p in zip(param_names, param_objs)}
+        bound_check = check_physical_boundary(**{k: param_vals[k] for k in param_names})
+        bnd_dist    = boundary_distance(param_vals)
+
+        errors_low  = {}
+        errors_high = {}
+        try:
+            hesse = fit_result.hesse()
+            for n, p in zip(param_names, param_objs):
+                err = float(hesse.get(p, {}).get("error", 0.0))
+                errors_low[n]  = -err
+                errors_high[n] =  err
+        except Exception:
+            for n in param_names:
+                errors_low[n] = errors_high[n] = 0.0
+
+        print(f"\n{'─'*50}")
+        print(f"{'Parâmetro':>10} {'Valor':>12} {'Erro-':>12} {'Erro+':>12}")
+        print(f"{'─'*50}")
+        for n in param_names:
+            print(f"{n:>10} {param_vals[n]:>12.5f} {errors_low.get(n, 0.0):>12.5f} {errors_high.get(n, 0.0):>12.5f}")
+        print(f"{'─'*50}")
+
+        res = {
+            "subsample"  : is_,
+            "converged"  : conv_check,
+            "physRegion" : bound_check,
+            "boundDist"  : bnd_dist,
+            "fitTime"    : fit_time,
+            **{f"{n}_best":  param_vals[n]  for n in param_names},
+            **{f"{n}_low":   errors_low.get(n, 0.0)  for n in param_names},
+            **{f"{n}_high":  errors_high.get(n, 0.0) for n in param_names},
+        }
+        results_list.append(res)
+
+        if plot:
+            plot_dir  = f"plotSimFit_d"
+            plot_path = os.path.join(plot_dir, f"simFitResult_recoMC_fullAngular_{short_string}_s{is_}.pdf")
+            plot_projections(all_datasets_by_sample[is_], pdfs_s, param_vals, plot_path, q2Bin, parity)
+
+    if save:
+        tag = f"recoMC_fullAngular_{stat_str}_{short_string}"
+        save_results(results_list[0], output_dir, tag)
+
+    return results_list
+
+
+# ════════════════════════════════════════════════════════════════
+# 11.  HELPERS DE DEMO
+# ════════════════════════════════════════════════════════════════
+class _FlatEfficiency:
+    int_vec: List[float] = []
+    def __call__(self, ctK, ctL, phi):
+        return np.ones(len(np.atleast_1d(ctK)))
+    def integral(self, i):
+        return 1.0
+
+def _make_flat_efficiency():
+    return _FlatEfficiency()
+
+
+# ════════════════════════════════════════════════════════════════
+# 12.  PONTO DE ENTRADA (main)
+# ════════════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(description="Fit simultâneo angular B0→K*μμ em MC reco (Python/zfit)")
+    parser.add_argument("--q2bin",   type=int,  default=0, help="Bin q² [0-8], -1 para todos")
+    parser.add_argument("--parity",  type=int,  default=0, help="Paridade: 0=par, 1=ímpar, -1=ambos")
+    parser.add_argument("--nSample", type=int,  default=0, help="Número de subsamples (0 = stat MC completa)")
+    parser.add_argument("--multi",   action="store_true", help="Ajustar múltiplos subsamples")
+    parser.add_argument("--noplot",  action="store_true", help="Desativa geração de plots")
+    parser.add_argument("--nosave",  action="store_true", help="Desativa salvamento de resultados")
+    parser.add_argument("--outdir",  type=str, default="simFitResults", help="Pasta de saída")
+    args = parser.parse_args()
+
+    q2_bins  = list(range(N_BINS)) if args.q2bin  == -1 else [args.q2bin]
+    parities = [0, 1]              if args.parity == -1 else [args.parity]
+
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║  simfit_recoMC_fullAngular.py  — Python/zfit version ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    
+    for q2Bin in q2_bins:
+        for parity in parities:
+            simfit_recoMC_fullAngularBin(
+                q2Bin       = q2Bin,
+                parity      = parity,
+                multiSample = args.multi,
+                nSample     = args.nSample,
+                plot        = not args.noplot,
+                save        = not args.nosave,
+                output_dir  = args.outdir,
+            )
+
+    print("\nTodos os fits concluídos.")
+
+
+if __name__ == "__main__":
+    main()

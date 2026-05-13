@@ -1,31 +1,40 @@
 #include <iostream>
+#include <vector>
+#include <cmath>
 #include "TFile.h"
 #include "TTree.h"
 #include "TLorentzVector.h"
 #include "TVector3.h"
 #include "TRandom3.h"
+#include "TMath.h"
+#include "TString.h"
 #include "RooRealVar.h"
 #include "RooDataSet.h"
 #include "RooWorkspace.h"
+#include "RooArgSet.h"
+#include "RooAbsData.h"
 
 using namespace RooFit;
 
 void process_angles_simfit() {
-    // 1. Abrir o arquivo gerado pelo Python
-    TFile* f_in = TFile::Open("Filtered_Gen_Kinematics.root", "READ");
+    // Garantir compatibilidade de armazenamento de dados entre versões do ROOT
+    RooAbsData::setDefaultStorageType(RooAbsData::Tree);
+
+    // 1. Abrir o arquivo de entrada
+    TFile* f_in = TFile::Open("/eos/user/t/tdeandra/SWAN_projects/BPH_Analysis/Angular_Analysis/Filtered_Gen_Kinematics_NoFSR.root", "READ");
     if (!f_in || f_in->IsZombie()) {
         std::cerr << "Erro ao abrir Filtered_Gen_Kinematics.root" << std::endl;
         return;
     }
     TTree* tree = (TTree*)f_in->Get("Events");
 
-    // 2. Variáveis para ler a TTree
-    double B0_pt, B0_eta, B0_phi, B0_mass;
-    double Kst_pt, Kst_eta, Kst_phi, Kst_mass;
-    double mu1_pt, mu1_eta, mu1_phi, mu1_mass;
-    double mu2_pt, mu2_eta, mu2_phi, mu2_mass;
-    double K_pt, K_eta, K_phi, K_mass;
-    double pi_pt, pi_eta, pi_phi, pi_mass;
+    // 2. Variáveis para leitura da TTree
+    float B0_pt, B0_eta, B0_phi, B0_mass;
+    float Kst_pt, Kst_eta, Kst_phi, Kst_mass;
+    float mu1_pt, mu1_eta, mu1_phi, mu1_mass;
+    float mu2_pt, mu2_eta, mu2_phi, mu2_mass; 
+    float K_pt, K_eta, K_phi, K_mass;
+    float pi_pt, pi_eta, pi_phi, pi_mass;
 
     tree->SetBranchAddress("B0_pt", &B0_pt); tree->SetBranchAddress("B0_eta", &B0_eta); tree->SetBranchAddress("B0_phi", &B0_phi); tree->SetBranchAddress("B0_mass", &B0_mass);
     tree->SetBranchAddress("Kst_pt", &Kst_pt); tree->SetBranchAddress("Kst_eta", &Kst_eta); tree->SetBranchAddress("Kst_phi", &Kst_phi); tree->SetBranchAddress("Kst_mass", &Kst_mass);
@@ -34,27 +43,25 @@ void process_angles_simfit() {
     tree->SetBranchAddress("K_pt", &K_pt); tree->SetBranchAddress("K_eta", &K_eta); tree->SetBranchAddress("K_phi", &K_phi); tree->SetBranchAddress("K_mass", &K_mass);
     tree->SetBranchAddress("pi_pt", &pi_pt); tree->SetBranchAddress("pi_eta", &pi_eta); tree->SetBranchAddress("pi_phi", &pi_phi); tree->SetBranchAddress("pi_mass", &pi_mass);
 
-    // 3. Preparar RooFit Variables
+    // 3. Preparar Variáveis RooFit
+    RooRealVar ctK("ctK", "ctK", -1, 1);
+    RooRealVar ctL("ctL", "ctL", -1, 1);
+    RooRealVar phi("phi", "phi", -TMath::Pi(), TMath::Pi());
+    RooRealVar rand("rand", "rand", 0, 1);
     RooRealVar mass("mass", "mass", 5.0, 5.6);
-    RooRealVar ctK("ctK", "cos(#theta_{K})", -1.0, 1.0);
-    RooRealVar ctL("ctL", "cos(#theta_{L})", -1.0, 1.0);
-    RooRealVar phi("phi", "#phi", -TMath::Pi(), TMath::Pi());
-    RooRealVar rand("rand", "rand", 0.0, 1.0);
-    RooArgSet argset(mass, ctK, ctL, phi, rand);
+    RooArgSet argset(ctK, ctL, phi, rand, mass);
 
-    // Arrays para guardar os datasets de cada bin
     const int nBins = 9;
-    RooDataSet* base_datasets[nBins];
+    std::vector<RooDataSet*> base_datasets;
     for (int i = 0; i < nBins; ++i) {
-        TString dsName = Form("ds_b%d", i);
-        base_datasets[i] = new RooDataSet(dsName, dsName, argset);
+        base_datasets.push_back(new RooDataSet(Form("tmp_b%d", i), "tmp", argset));
     }
 
     TRandom3 rand_gen(12345);
     Long64_t nEntries = tree->GetEntries();
-    std::cout << "Processando " << nEntries << " eventos no C++..." << std::endl;
+    std::cout << "Processando " << nEntries << " eventos..." << std::endl;
 
-    // 4. Loop sobre os eventos
+    // 4. Loop de Processamento
     for (Long64_t i = 0; i < nEntries; ++i) {
         tree->GetEntry(i);
 
@@ -80,7 +87,7 @@ void process_angles_simfit() {
         
         if (b == -1) continue;
 
-        // Cálculos Angulares
+        // --- Cálculos Angulares com Proteção ---
         TLorentzVector pmumu = pmu1 + pmu2;
         TVector3 b_mumu = -pmumu.BoostVector();
         TLorentzVector mu1_m = pmu1; mu1_m.Boost(b_mumu);
@@ -98,12 +105,20 @@ void process_angles_simfit() {
         TLorentzVector k_b = pK; k_b.Boost(b_b0);
         TLorentzVector pi_b = ppi; pi_b.Boost(b_b0);
 
-        TVector3 n_mumu = mu1_b.Vect().Cross(mu2_b.Vect()).Unit();
-        TVector3 n_Kpi  = k_b.Vect().Cross(pi_b.Vect()).Unit();
+        TVector3 n_mumu = mu1_b.Vect().Cross(mu2_b.Vect());
+        TVector3 n_Kpi  = k_b.Vect().Cross(pi_b.Vect());
+        
+        // Proteção contra cross products nulos
+        if (n_mumu.Mag() == 0 || n_Kpi.Mag() == 0) continue;
+        
+        n_mumu = n_mumu.Unit();
+        n_Kpi  = n_Kpi.Unit();
         TVector3 z_axis = (k_b + pi_b).Vect().Unit();
         double val_phi = atan2((n_mumu.Cross(n_Kpi)).Dot(z_axis), n_mumu.Dot(n_Kpi));
 
-        // Preenche o Dataset
+        // Filtro Final contra NANs antes de adicionar ao Dataset
+        if (std::isnan(val_ctK) || std::isnan(val_ctL) || std::isnan(val_phi)) continue;
+
         ctK.setVal(val_ctK); 
         ctL.setVal(val_ctL); 
         phi.setVal(val_phi); 
@@ -112,30 +127,33 @@ void process_angles_simfit() {
         
         base_datasets[b]->add(argset);
     }
-
     f_in->Close();
 
-    // 5. Salvar nos arquivos finais
+    // 5. Exportação
     for (int i = 0; i < nBins; ++i) {
         if (base_datasets[i]->numEntries() == 0) continue;
         
-        TString fileName = Form("effDataset_GENOnly_b%d.root", i);
-        TFile* f_out = new TFile(fileName, "RECREATE");
+        TString fileName = Form("./effDataset_GENOnly_b%d.root", i);
+        TFile* f_out = TFile::Open(fileName, "RECREATE");
 
-        for (int p = 0; p < 2; ++p) { // Reproduz o seu loop de p=0 e p=1
+        for (int p = 0; p < 2; ++p) {
             TString wsName = Form("ws_b%dp%d", i, p);
             RooWorkspace ws(wsName);
             
             TString nameEv = Form("data_genDen_ev_b%d", i);
             TString nameOd = Form("data_genDen_od_b%d", i);
             
-            ws.import(*base_datasets[i], RenameVariable("ctK","ctK"), Rename(nameEv));
-            ws.import(*base_datasets[i], RenameVariable("ctK","ctK"), Rename(nameOd));
+            ws.import(*base_datasets[i], Rename(nameEv));
+            ws.import(*base_datasets[i], Rename(nameOd));
             
             ws.Write();
         }
-        
         f_out->Close();
-        std::cout << "Arquivo " << fileName << " salvo com sucesso!" << std::endl;
+        std::cout << "Bin " << i << " salva com sucesso em " << fileName << " (" << base_datasets[i]->numEntries() << " eventos)." << std::endl;
     }
+}
+
+int main() {
+    process_angles_simfit();
+    return 0;
 }
